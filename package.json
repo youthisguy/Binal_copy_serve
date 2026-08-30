@@ -5,7 +5,7 @@
   "type": "module",
   "description": "copy-trading service for Binal Bot signals",
   "scripts": {
-    "start": "node --env-file=.env local-server.mjs",
+    "start": "node local-server.mjs",
     "dev": "node --env-file=.env --watch local-server.mjs"
   },
   "dependencies": {
@@ -13,6 +13,6 @@
     "better-sqlite3": "^11.3.0"
   },
   "engines": {
-    "node": ">=20.6.0"
+    "node": "20.18.1"
   }
 }

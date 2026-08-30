@@ -41,7 +41,7 @@ import Database from "better-sqlite3";
 const RPC_URL = process.env.COPY_RPC_URL;
 const VAULT_ADDRESS = process.env.COPY_VAULT_ADDRESS;
 const OPERATOR_KEY = process.env.COPY_BOT_OPERATOR_PRIVATE_KEY;
-const PORT = Number(process.env.COPY_API_PORT ?? 8788);
+const PORT = Number(process.env.PORT ?? process.env.COPY_API_PORT ?? 8788);
 const DB_PATH = process.env.COPY_DB_PATH ?? "copy-trade.db";
 const QTY_STEP = Number(process.env.COPY_QTY_STEP ?? 0.01);
 
@@ -286,6 +286,7 @@ function isAddress(a) {
 }
 
 const routes = {
+  "GET /": async (_req, res) => json(res, 200, { ok: true }),
   "POST /api/signal": async (req, res) => {
     const signal = await readBody(req);
     if (!signal.marketId || !signal.side || typeof signal.price !== "number") {
@@ -377,6 +378,6 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  log("server", `listening on http://localhost:${PORT}`);
+  log("server", `listening on port ${PORT}`);
   log("server", `vault: ${VAULT_ADDRESS}, operator: ${operatorWallet.address}`);
 });
