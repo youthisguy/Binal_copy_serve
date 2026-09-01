@@ -17,6 +17,7 @@
 import { createServer } from "node:http";
 import { ethers } from "ethers";
 import Database from "better-sqlite3";
+import { timingSafeEqual } from "node:crypto";
 
 // ── Config ──────────────────────────────────────────────────────────
 const RPC_URL = process.env.COPY_RPC_URL;
@@ -25,6 +26,7 @@ const OPERATOR_KEY = process.env.COPY_BOT_OPERATOR_PRIVATE_KEY;
 const PORT = Number(process.env.PORT ?? process.env.COPY_API_PORT ?? 8788);
 const DB_PATH = process.env.COPY_DB_PATH ?? "copy-trade.db";
 const QTY_STEP = Number(process.env.COPY_QTY_STEP ?? 0.01);
+const WEBHOOK_SECRET = process.env.COPY_WEBHOOK_SECRET;
 
 if (!RPC_URL || !VAULT_ADDRESS || !OPERATOR_KEY) {
   console.error(
@@ -32,6 +34,11 @@ if (!RPC_URL || !VAULT_ADDRESS || !OPERATOR_KEY) {
   );
   process.exit(1);
 }
+
+ if (!WEBHOOK_SECRET) {
+     console.error("Missing required env var: COPY_WEBHOOK_SECRET");
+     process.exit(1);
+   }
 
 // ── Chain setup ─────────────────────────────────────────────────────
 // Matches the CURRENT deployed contract: struct-based openPositionFor,
@@ -60,7 +67,7 @@ async function decimals() {
       ["function decimals() view returns (uint8)"],
       provider
     );
-    collateralDecimals = Number(await token.decimals()); 
+    collateralDecimals = Number(await token.decimals());
   }
   return collateralDecimals;
 }
@@ -133,6 +140,15 @@ function knownWallets() {
     .prepare(`SELECT wallet_address FROM users`)
     .all()
     .map((r) => r.wallet_address);
+}
+
+function isValidWebhookSecret(req) {
+  const supplied = req.headers["x-webhook-secret"];
+  if (typeof supplied !== "string" || supplied.length === 0) return false;
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(WEBHOOK_SECRET);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
 }
 
 function rawPriceQty(price, quantity, dec) {
@@ -416,6 +432,10 @@ function isAddress(a) {
 const routes = {
   "GET /": async (_req, res) => json(res, 200, { ok: true }),
   "POST /api/signal": async (req, res) => {
+    if (!isValidWebhookSecret(req)) {
+      log("signal", `rejected: missing/invalid x-webhook-secret from ${req.socket.remoteAddress}`);
+      return json(res, 401, { error: "unauthorized" });
+    }
     const signal = await readBody(req);
     if (!signal.marketId || !signal.side || typeof signal.price !== "number") {
       return json(res, 400, { error: "invalid signal payload" });
@@ -427,6 +447,10 @@ const routes = {
   },
 
   "POST /api/settlement": async (req, res) => {
+    if (!isValidWebhookSecret(req)) {
+      log("settlement", `rejected: missing/invalid x-webhook-secret from ${req.socket.remoteAddress}`);
+      return json(res, 401, { error: "unauthorized" });
+    }
     const settlement = await readBody(req);
     if (
       !settlement.marketId ||
