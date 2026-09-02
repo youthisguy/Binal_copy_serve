@@ -10,27 +10,16 @@ import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contr
 /**
  * CopyVault — per-user tracked copy-trading vault built for Binal Bot.
  *
- *   - NOT pooled. Every user's balance and every position is tracked
- *     individually (`accounts`, `positions`). No shared pool, no
- *     share-price math, no cross-user contamination.
- *   - withdraw() ALWAYS works, independent of operator/owner state.
- *     This is the real kill switch.
- *   - Fee is taken ONLY on realized profit, at settlement, hard-capped
- *     in code (MAX_FEE_BPS) — never on deposits/withdrawal, never on losses.
- *   - operator can ONLY open/settle positions for users who explicitly
- *     opted in (copyEnabled == true) — cannot withdraw anyone's funds,
- *     cannot touch a non-opted-in user at all.
- *
- * Fill accounting:
+  * Fill accounting:
  *   - After placeBinaryOrder, net collateral spent is measured via balance
  *     delta (handles better fill price + exchange refunds).
  *   - Unspent collateral is refunded to the user's idle balance.
- *   - shares still = quantityRaw (full-fill assumption).
- *
+ *   - shares = quantityRaw (full-fill assumption).
  * Settlement funding:
- *   - On settle, operator must have approved this vault for `payout`.
- *   - Contract pulls `payout` tUSDC from the operator, takes fee on profit,
- *     credits netPayout to the user's idle (deposited) balance for withdraw.
+ *   1) Operator calls redeemMarket(marketId, winningSide) once after resolution
+ *      → redeemNative on the collateral router → collateral into marketPot.
+ *   2) settlePosition spends marketPot first; operator wallet only covers shortfall.
+ *   3) Fee on profit only; netPayout → user idle balance for withdraw.
  */
 
 interface IBinaryPool {
@@ -53,16 +42,33 @@ interface IBinaryMarket {
     function collateral() external view returns (address);
 }
 
+interface ICollateralRouter {
+    // Return type intentionally unmodeled — we measure the balance delta
+    // instead of trusting a decoded return value we haven't verified.
+    function redeemNative(
+        uint32 operatorId,
+        bytes32 venueId,
+        bytes32 marketId,
+        uint8 outcomeIdx,
+        uint256 amount
+    ) external;
+}
+
 contract CopyVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ── Config ──────────────────────────────────────────────────────
     IERC20 public immutable collateralToken;
     uint8 public immutable collateralDecimals;
-    uint256 public constant MAX_FEE_BPS = 2000;  
+    uint256 public constant MAX_FEE_BPS = 2000;
     uint256 public feeBps;
     address public feeRecipient;
     address public operator;
+
+    // DreamDEX venue identifiers (same as bot config) — fixed at deploy
+    address public immutable collateralRouter;
+    bytes32 public immutable venueId;
+    uint32 public immutable operatorId;
 
     // ── Storage ─────────────────────────────────────────────────────
     struct UserAccount {
@@ -104,6 +110,12 @@ contract CopyVault is Ownable, ReentrancyGuard {
     mapping(uint256 => Position) public positions;
     uint256 public nextPositionId;
 
+    // Aggregate shares per (marketId, side) — incremented on open
+    mapping(bytes32 => mapping(uint8 => uint256)) public marketSideShares;
+    // Collateral recovered by redeemMarket; spent by settlePosition
+    mapping(bytes32 => uint256) public marketPot;
+    mapping(bytes32 => bool) public marketRedeemed;
+
     // ── Events ──────────────────────────────────────────────────────
     event Deposited(address indexed user, uint256 amount);
     event Withdrawn(address indexed user, uint256 amount);
@@ -127,6 +139,12 @@ contract CopyVault is Ownable, ReentrancyGuard {
     event OperatorChanged(address indexed oldOperator, address indexed newOperator);
     event FeeBpsChanged(uint256 oldFeeBps, uint256 newFeeBps);
     event FeeRecipientChanged(address indexed oldRecipient, address indexed newRecipient);
+    event MarketRedeemed(
+        bytes32 indexed marketId,
+        uint8 indexed side,
+        uint256 amountRedeemed,
+        uint256 collateralRecovered
+    );
 
     // ── Modifiers ───────────────────────────────────────────────────
     modifier onlyOperator() {
@@ -138,18 +156,25 @@ contract CopyVault is Ownable, ReentrancyGuard {
         address _collateralToken,
         address _operator,
         address _feeRecipient,
-        uint256 _feeBps
+        uint256 _feeBps,
+        address _collateralRouter,
+        bytes32 _venueId,
+        uint32 _operatorId
     ) Ownable(msg.sender) {
         require(_collateralToken != address(0), "CopyVault: zero collateral token");
         require(_operator != address(0), "CopyVault: zero operator");
         require(_feeRecipient != address(0), "CopyVault: zero fee recipient");
         require(_feeBps <= MAX_FEE_BPS, "CopyVault: fee exceeds cap");
+        require(_collateralRouter != address(0), "CopyVault: zero collateral router");
 
         collateralToken = IERC20(_collateralToken);
         collateralDecimals = IERC20Metadata(_collateralToken).decimals();
         operator = _operator;
         feeRecipient = _feeRecipient;
         feeBps = _feeBps;
+        collateralRouter = _collateralRouter;
+        venueId = _venueId;
+        operatorId = _operatorId;
     }
 
     // ── User-facing ─────────────────────────────────────────────────
@@ -161,10 +186,6 @@ contract CopyVault is Ownable, ReentrancyGuard {
         emit Deposited(msg.sender, amount);
     }
 
-    /**
-     * Kill switch: always works from idle balance only.
-     * Locked funds return only via settlePosition.
-     */
     function withdraw(uint256 amount) external nonReentrant {
         UserAccount storage acct = accounts[msg.sender];
         require(amount > 0, "CopyVault: zero amount");
@@ -202,7 +223,6 @@ contract CopyVault is Ownable, ReentrancyGuard {
         require(p.collateral <= acct.tradeSize, "CopyVault: exceeds user's per-trade size");
         require(p.collateral <= acct.balance, "CopyVault: exceeds idle balance");
 
-        // Lock full committed collateral up front
         acct.balance -= p.collateral;
         acct.lockedInTrades += p.collateral;
 
@@ -218,7 +238,6 @@ contract CopyVault is Ownable, ReentrancyGuard {
             p.collateral
         );
 
-        // Refund unspent collateral (better fill price / partial notional)
         if (usedCollateral < p.collateral) {
             uint256 refund = p.collateral - usedCollateral;
             acct.balance += refund;
@@ -235,6 +254,8 @@ contract CopyVault is Ownable, ReentrancyGuard {
             settled: false
         });
 
+        marketSideShares[p.marketId][uint8(p.side)] += shares;
+
         emit PositionOpened(
             positionId,
             p.user,
@@ -246,10 +267,41 @@ contract CopyVault is Ownable, ReentrancyGuard {
     }
 
     /**
-     * Settles a position.
-     * Operator must approve this contract for `payout` of collateralToken.
-     * Pulls payout from operator → fee on profit to feeRecipient →
-     * netPayout credited to user's idle vault balance (withdraw anytime).
+     * Redeem vault-held outcome for one market+side once after resolution.
+     * Collateral recovered goes to marketPot[marketId].
+     * Call BEFORE settling positions on that market when possible.
+     * If skipped/fails, settlePosition still works via operator wallet.
+     */
+    function redeemMarket(
+        bytes32 marketId,
+        uint8 side
+    ) external onlyOperator nonReentrant {
+        require(!marketRedeemed[marketId], "CopyVault: already redeemed");
+        uint256 amount = marketSideShares[marketId][side];
+        require(amount > 0, "CopyVault: nothing to redeem for this market/side");
+        marketRedeemed[marketId] = true;
+
+        uint256 beforeBal = collateralToken.balanceOf(address(this));
+
+        ICollateralRouter(collateralRouter).redeemNative(
+            operatorId,
+            venueId,
+            marketId,
+            side,
+            amount
+        );
+
+        uint256 afterBal = collateralToken.balanceOf(address(this));
+        require(afterBal >= beforeBal, "CopyVault: unexpected collateral decrease on redeem");
+        uint256 recovered = afterBal - beforeBal;
+
+        marketPot[marketId] += recovered;
+        emit MarketRedeemed(marketId, side, amount, recovered);
+    }
+
+    /**
+     * Settles a position. Spends marketPot first; operator covers shortfall.
+     * Fee on profit only; net → user idle balance.
      */
     function settlePosition(
         uint256 positionId,
@@ -263,9 +315,15 @@ contract CopyVault is Ownable, ReentrancyGuard {
         UserAccount storage acct = accounts[pos.user];
         acct.lockedInTrades -= pos.collateralAtEntry;
 
-        // Fund settlement: pull full payout from operator into the vault
         if (payout > 0) {
-            collateralToken.safeTransferFrom(msg.sender, address(this), payout);
+            uint256 pot = marketPot[pos.marketId];
+            if (pot >= payout) {
+                marketPot[pos.marketId] = pot - payout;
+            } else {
+                uint256 shortfall = payout - pot;
+                marketPot[pos.marketId] = 0;
+                collateralToken.safeTransferFrom(msg.sender, address(this), shortfall);
+            }
         }
 
         uint256 fee = 0;
@@ -328,13 +386,6 @@ contract CopyVault is Ownable, ReentrancyGuard {
 
     // ── Internal ────────────────────────────────────────────────────
 
-    /**
-     * Places the binary order and measures net collateral spent via balance delta.
-     * shares = quantityRaw (full-fill assumption).
-     *
-     * kind: 0 BUY_YES, 2 BUY_NO
-     * orderType 2 must match the exchange (same as observed testnet tx).
-     */
     function _placeTradeOnExchange(
         address pool,
         Side side,
@@ -346,40 +397,43 @@ contract CopyVault is Ownable, ReentrancyGuard {
         uint64 expireTimestampNs,
         uint256 collateral
     ) internal returns (uint256 shares, uint256 usedCollateral) {
-        uint8 kind = side == Side.Yes ? 0 : 2;
+        {
+            address market = IBinaryPool(pool).market();
+            require(
+                IBinaryMarket(market).collateral() == address(collateralToken),
+                "CopyVault: market collateral mismatch"
+            );
+        }
 
-        address market = IBinaryPool(pool).market();
-        address token = IBinaryMarket(market).collateral();
-        require(token == address(collateralToken), "CopyVault: market collateral mismatch");
+        {
+            uint256 required = (priceRaw * quantityRaw) / (10 ** collateralDecimals);
+            require(required <= collateral, "CopyVault: price*quantity exceeds committed collateral");
+            collateralToken.forceApprove(pool, required);
+        }
 
-        uint256 required = (priceRaw * quantityRaw) / (10 ** collateralDecimals);
-        require(required <= collateral, "CopyVault: price*quantity exceeds committed collateral");
+        usedCollateral = collateralToken.balanceOf(address(this));
 
-        collateralToken.forceApprove(pool, required);
+        {
+            uint8 kind = side == Side.Yes ? 0 : 2;
+            (bool success, ) = IBinaryPool(pool).placeBinaryOrder(
+                kind,
+                priceRaw,
+                quantityRaw,
+                expireTimestampNs,
+                2,
+                0,
+                address(0),
+                0,
+                0
+            );
+            require(success, "CopyVault: placeBinaryOrder rejected");
+        }
 
-        uint256 colBefore = collateralToken.balanceOf(address(this));
-
-        (bool success, ) = IBinaryPool(pool).placeBinaryOrder(
-            kind,
-            priceRaw,
-            quantityRaw,
-            expireTimestampNs,
-            2,          // orderType
-            0,          // selfMatchingOption
-            address(0), // builder
-            0,          // builderFeeBpsTimes1k
-            0           // userData
-        );
-        require(success, "CopyVault: placeBinaryOrder rejected");
-
-        uint256 colAfter = collateralToken.balanceOf(address(this));
-        require(colBefore >= colAfter, "CopyVault: unexpected collateral increase");
-        usedCollateral = colBefore - colAfter;
+        usedCollateral = usedCollateral - collateralToken.balanceOf(address(this));
         require(usedCollateral > 0, "CopyVault: zero fill (no collateral spent)");
         require(usedCollateral <= collateral, "CopyVault: spent more than committed");
 
         collateralToken.forceApprove(pool, 0);
-
         shares = quantityRaw;
     }
 }

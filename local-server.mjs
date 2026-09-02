@@ -35,10 +35,10 @@ if (!RPC_URL || !VAULT_ADDRESS || !OPERATOR_KEY) {
   process.exit(1);
 }
 
- if (!WEBHOOK_SECRET) {
-     console.error("Missing required env var: COPY_WEBHOOK_SECRET");
-     process.exit(1);
-   }
+if (!WEBHOOK_SECRET) {
+  console.error("Missing required env var: COPY_WEBHOOK_SECRET");
+  process.exit(1);
+}
 
 // ── Chain setup ─────────────────────────────────────────────────────
 // Matches the CURRENT deployed contract: struct-based openPositionFor,
@@ -48,6 +48,7 @@ const VAULT_ABI = [
   "function accounts(address user) view returns (uint256 balance, uint256 lockedInTrades, bool copyEnabled, uint256 tradeSize)",
   "function getAccount(address user) view returns (uint256 balance, uint256 lockedInTrades, bool copyEnabled, uint256 tradeSize)",
   "function settlePosition(uint256 positionId, uint256 payout)",
+  "function redeemMarket(bytes32 marketId, uint8 side)",
   "function getPosition(uint256 positionId) view returns (tuple(address user, bytes32 marketId, uint8 side, uint256 shares, uint256 collateralAtEntry, bool settled))",
   "function openPositionFor((address user, bytes32 marketId, uint8 side, uint256 collateral, address pool, address outcomeToken, uint256 yesId, uint256 noId, uint256 priceRaw, uint256 quantityRaw, uint64 expireTimestampNs) p) returns (uint256 positionId)",
   "event PositionOpened(uint256 indexed positionId, address indexed user, bytes32 marketId, uint8 side, uint256 collateral, uint256 shares)",
@@ -327,7 +328,8 @@ async function handleSettlement(settlement) {
     .all(settlement.marketId);
   if (open.length === 0) return;
   const dec = await decimals();
-  // Pre-approve once (operator wallet funds all wins in this batch)
+
+  // Pre-approve once  
   const tokenAddr = await vault.collateralToken();
   const token = new ethers.Contract(
     tokenAddr,
@@ -344,6 +346,39 @@ async function handleSettlement(settlement) {
   if (allowance < ethers.MaxUint256 / 2n) {
     await (await token.approve(VAULT_ADDRESS, ethers.MaxUint256)).wait();
     log("settlement", `approved vault MaxUint256 for collateral pulls`);
+  }
+
+  // ── redeem once per market before settling any position ──
+  // Only when there is something to redeem (WIN). LOSS has no pot.
+  // side: 0 = Yes, 1 = No — must match what was opened and the winning outcome.
+  if (settlement.outcome === "WIN" || settlement.payoutPerShare > 0) {
+    try {
+      // Prefer bot-supplied winning side if present; else derive from open trades
+      const sideCode =
+        settlement.winningSide === "BUY_NO" || settlement.winningSide === 1
+          ? 1
+          : settlement.winningSide === "BUY_YES" || settlement.winningSide === 0
+            ? 0
+            : open[0].side === "BUY_NO"
+              ? 1
+              : 0;
+
+      const redeemTx = await vault.redeemMarket(
+        settlement.marketId,
+        sideCode
+      );
+      const redeemReceipt = await redeemTx.wait();
+      log(
+        "settlement",
+        `redeemMarket ${settlement.marketId} side=${sideCode} tx=${redeemReceipt.hash}`
+      );
+    } catch (e) {
+      // Non-fatal: settlePosition still works via operator wallet shortfall
+      log(
+        "settlement",
+        `redeemMarket skipped/failed: ${e.shortMessage ?? e.message}`
+      );
+    }
   }
 
   for (const trade of open) {
@@ -433,7 +468,10 @@ const routes = {
   "GET /": async (_req, res) => json(res, 200, { ok: true }),
   "POST /api/signal": async (req, res) => {
     if (!isValidWebhookSecret(req)) {
-      log("signal", `rejected: missing/invalid x-webhook-secret from ${req.socket.remoteAddress}`);
+      log(
+        "signal",
+        `rejected: missing/invalid x-webhook-secret from ${req.socket.remoteAddress}`
+      );
       return json(res, 401, { error: "unauthorized" });
     }
     const signal = await readBody(req);
@@ -448,7 +486,10 @@ const routes = {
 
   "POST /api/settlement": async (req, res) => {
     if (!isValidWebhookSecret(req)) {
-      log("settlement", `rejected: missing/invalid x-webhook-secret from ${req.socket.remoteAddress}`);
+      log(
+        "settlement",
+        `rejected: missing/invalid x-webhook-secret from ${req.socket.remoteAddress}`
+      );
       return json(res, 401, { error: "unauthorized" });
     }
     const settlement = await readBody(req);
