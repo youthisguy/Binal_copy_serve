@@ -154,7 +154,11 @@ function isValidWebhookSecret(req) {
 
 function rawPriceQty(price, quantity, dec) {
   const d = Number(dec);
-  const steppedQty = Math.floor(Number(quantity) / QTY_STEP) * QTY_STEP;
+  // floor to QTY_STEP, then make sure we never go below one step
+  let steppedQty = Math.floor(Number(quantity) / QTY_STEP) * QTY_STEP;
+  if (steppedQty < QTY_STEP && Number(quantity) >= QTY_STEP * 0.5) {
+    steppedQty = QTY_STEP; // rescue near-misses
+  }
   const priceRaw = ethers.parseUnits(Number(price).toFixed(d), d);
   const quantityRaw = ethers.parseUnits(steppedQty.toFixed(d), d);
   return { priceRaw, quantityRaw, steppedQty };
@@ -183,11 +187,32 @@ async function copyForUser(wallet, signal, dec) {
     }
 
     const collateral = Number(ethers.formatUnits(collateralRaw, dec));
-    const quantity = collateral / signal.price;
+
+    const CROSS_BUFFER = Number(process.env.COPY_CROSS_BUFFER ?? 0.015);
+    const MAX_AGGRESSIVE_PRICE = Number(process.env.COPY_MAX_PRICE ?? 0.80);
+    
+    
+    const base = Number(signal.price);
+
+    if (base >= MAX_AGGRESSIVE_PRICE) {
+      log("signal", `${wallet}: skip — base price ${base} already at/above cap ${MAX_AGGRESSIVE_PRICE}`);
+      return;
+    }
+    const buffer = Math.max(0.01, Math.min(0.025, base * 0.04));
+    const aggressivePrice = Math.min(MAX_AGGRESSIVE_PRICE, base + buffer);
+
+    const quantity = collateral / aggressivePrice;
     const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(
-      signal.price,
+      aggressivePrice,
       quantity,
       dec
+    );
+    log(
+      "signal",
+      `${wallet}: trying open ${
+        signal.side
+      } ${steppedQty} @ ${aggressivePrice.toFixed(4)} ` +
+        `bot sent ${signal.price}, buffer +${buffer.toFixed(4)}) on ${signal.symbol}`
     );
     if (steppedQty <= 0) {
       log(
@@ -329,7 +354,7 @@ async function handleSettlement(settlement) {
   if (open.length === 0) return;
   const dec = await decimals();
 
-  // Pre-approve once  
+  // Pre-approve once
   const tokenAddr = await vault.collateralToken();
   const token = new ethers.Contract(
     tokenAddr,
@@ -358,15 +383,12 @@ async function handleSettlement(settlement) {
         settlement.winningSide === "BUY_NO" || settlement.winningSide === 1
           ? 1
           : settlement.winningSide === "BUY_YES" || settlement.winningSide === 0
-            ? 0
-            : open[0].side === "BUY_NO"
-              ? 1
-              : 0;
+          ? 0
+          : open[0].side === "BUY_NO"
+          ? 1
+          : 0;
 
-      const redeemTx = await vault.redeemMarket(
-        settlement.marketId,
-        sideCode
-      );
+      const redeemTx = await vault.redeemMarket(settlement.marketId, sideCode);
       const redeemReceipt = await redeemTx.wait();
       log(
         "settlement",
@@ -549,33 +571,36 @@ const routes = {
     });
   },
 
-  "GET /api/copy/leaderboard": async (_req, res) => {
-    const rows = db
-      .prepare(
-        `
-      SELECT wallet_address,
-             SUM(CASE WHEN status='SETTLED' THEN net_pnl ELSE 0 END) as pnl,
-             SUM(CASE WHEN status='SETTLED' AND outcome='WIN' THEN 1 ELSE 0 END) as wins,
-             SUM(CASE WHEN status='SETTLED' THEN 1 ELSE 0 END) as settled
-      FROM copy_trades GROUP BY wallet_address ORDER BY pnl DESC LIMIT 50
-    `
-      )
-      .all();
-    const { count } = db
-      .prepare(
-        `SELECT COUNT(DISTINCT wallet_address) as count FROM copy_trades WHERE status='OPEN'`
-      )
-      .get();
-    return json(res, 200, {
-      activeCopiers: count,
-      leaderboard: rows.map((r) => ({
-        wallet: r.wallet_address,
-        pnl: r.pnl ?? 0,
-        winRate: r.settled ? r.wins / r.settled : null,
-        settledCount: r.settled,
-      })),
-    });
-  },
+"GET /api/copy/leaderboard": async (_req, res) => {
+  const rows = db
+    .prepare(
+      `
+    SELECT wallet_address,
+           SUM(CASE WHEN status='SETTLED' THEN net_pnl ELSE 0 END) as pnl,
+           SUM(CASE WHEN status='SETTLED' AND outcome='WIN' THEN 1 ELSE 0 END) as wins,
+           SUM(CASE WHEN status='SETTLED' THEN 1 ELSE 0 END) as settled
+    FROM copy_trades
+    GROUP BY wallet_address
+    ORDER BY pnl DESC
+    LIMIT 50
+  `
+    )
+    .all();
+
+  const { count } = db
+    .prepare(`SELECT COUNT(*) as count FROM users`)
+    .get();
+
+  return json(res, 200, {
+    activeCopiers: count ?? 0,
+    leaderboard: rows.map((r) => ({
+      wallet: r.wallet_address,
+      pnl: r.pnl ?? 0,
+      winRate: r.settled ? r.wins / r.settled : null,
+      settledCount: r.settled,
+    })),
+  });
+},
 };
 
 const server = createServer(async (req, res) => {
