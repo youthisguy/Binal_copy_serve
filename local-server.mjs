@@ -9,13 +9,9 @@
  *   POST /api/signal      - a new trade signal, opens positions for opted-in users
  *   POST /api/settlement  - a market resolved, settles all open positions on it
  *
- * Setup:
- *   npm install ethers better-sqlite3
- *   node --env-file=.env local-server.mjs
- *
  */
 import { createServer } from "node:http";
-import { ethers } from "ethers";
+import { ethers, NonceManager } from "ethers";
 import Database from "better-sqlite3";
 import { timingSafeEqual } from "node:crypto";
 
@@ -56,7 +52,8 @@ const VAULT_ABI = [
 ];
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
-const operatorWallet = new ethers.Wallet(OPERATOR_KEY, provider);
+const rawWallet = new ethers.Wallet(OPERATOR_KEY, provider);
+const operatorWallet = new NonceManager(rawWallet);
 const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, operatorWallet);
 
 let collateralDecimals = null;
@@ -75,6 +72,53 @@ async function decimals() {
 
 const log = (scope, s) =>
   console.log(`${new Date().toISOString()} [${scope}] ${s}`);
+
+// ── Transaction Queue & Retry Setup ─────────────────────────────────
+let txQueue = Promise.resolve();
+
+/**
+ * Serializes transaction execution to prevent nonce desynchronization
+ * during concurrent calls.
+ */
+function queueTx(txFn) {
+  const next = txQueue.then(() => txFn());
+  txQueue = next.catch(() => {});
+  return next;
+}
+
+/**
+ * Wraps a transaction function in the broadcast queue with automatic
+ * exponential backoff retry logic for transient RPC / network errors.
+ */
+async function executeTxWithRetry(txFn, maxRetries = 3, initialDelayMs = 200) {
+  return queueTx(async () => {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await txFn();
+      } catch (err) {
+        attempt++;
+        const isRevert =
+          err.code === "CALL_EXCEPTION" ||
+          err.message?.includes("execution reverted");
+
+        // Fail fast on contract execution reverts or max retries
+        if (attempt >= maxRetries || isRevert) {
+          throw err;
+        }
+
+        const delay = initialDelayMs * Math.pow(2, attempt - 1);
+        log(
+          "tx",
+          `Broadcast error (attempt ${attempt}/${maxRetries}): ${
+            err.shortMessage ?? err.message
+          }. Retrying in ${delay}ms...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  });
+}
 
 // ── DB setup ────────────────────────────────────────────────────────
 const db = new Database(DB_PATH);
@@ -187,18 +231,22 @@ async function copyForUser(wallet, signal, dec) {
     }
 
     const collateral = Number(ethers.formatUnits(collateralRaw, dec));
-
-    const CROSS_BUFFER = Number(process.env.COPY_CROSS_BUFFER ?? 0.015);
     const MAX_AGGRESSIVE_PRICE = Number(process.env.COPY_MAX_PRICE ?? 0.80);
-    
-    
     const base = Number(signal.price);
 
     if (base >= MAX_AGGRESSIVE_PRICE) {
-      log("signal", `${wallet}: skip — base price ${base} already at/above cap ${MAX_AGGRESSIVE_PRICE}`);
+      log(
+        "signal",
+        `${wallet}: skip — base price ${base} already at/above cap ${MAX_AGGRESSIVE_PRICE}`
+      );
       return;
     }
-    const buffer = Math.max(0.01, Math.min(0.025, base * 0.04));
+
+    // Allow up to 0.10 (10%) slippage tolerance so larger trade sizes can fill without reverting
+    const MAX_SLIPPAGE_BUFFER = Number(
+      process.env.COPY_SLIPPAGE_BUFFER ?? 0.10
+    );
+    const buffer = Math.max(0.02, Math.min(MAX_SLIPPAGE_BUFFER, base * 0.10));
     const aggressivePrice = Math.min(MAX_AGGRESSIVE_PRICE, base + buffer);
 
     const quantity = collateral / aggressivePrice;
@@ -212,7 +260,9 @@ async function copyForUser(wallet, signal, dec) {
       `${wallet}: trying open ${
         signal.side
       } ${steppedQty} @ ${aggressivePrice.toFixed(4)} ` +
-        `bot sent ${signal.price}, buffer +${buffer.toFixed(4)}) on ${signal.symbol}`
+        `bot sent ${signal.price}, buffer +${buffer.toFixed(4)}) on ${
+          signal.symbol
+        }`
     );
     if (steppedQty <= 0) {
       log(
@@ -223,22 +273,28 @@ async function copyForUser(wallet, signal, dec) {
     }
 
     const sideCode = signal.side === "BUY_YES" ? 0 : 1;
-    const tx = await vault.openPositionFor({
-      user: wallet,
-      marketId: signal.marketId,
-      side: sideCode,
-      collateral: collateralRaw,
-      pool: signal.pool,
-      outcomeToken: ethers.ZeroAddress,
-      yesId: 0,
-      noId: 0,
-      priceRaw,
-      quantityRaw,
-      expireTimestampNs: (() => {
-        const ms = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
-        return BigInt(Math.floor(ms / 1000)) * 1_000_000_000n;
-      })(),
-    });
+
+    // Queue transaction submission and execute with retry
+    const tx = await executeTxWithRetry(() =>
+      vault.openPositionFor({
+        user: wallet,
+        marketId: signal.marketId,
+        side: sideCode,
+        collateral: collateralRaw,
+        pool: signal.pool,
+        outcomeToken: ethers.ZeroAddress,
+        yesId: 0,
+        noId: 0,
+        priceRaw,
+        quantityRaw,
+        expireTimestampNs: (() => {
+          const ms = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
+          return BigInt(Math.floor(ms / 1000)) * 1_000_000_000n;
+        })(),
+      })
+    );
+
+    // Mining wait runs outside mutex lock (concurrent across users)
     const receipt = await tx.wait();
 
     const opened = receipt.logs
@@ -250,18 +306,19 @@ async function copyForUser(wallet, signal, dec) {
         }
       })
       .find((e) => e?.name === "PositionOpened");
+
     if (!opened)
       throw new Error(
         `tx ${receipt.hash} confirmed but no PositionOpened event`
       );
 
     const positionId = Number(opened.args.positionId);
-
     const usedCollateral = Number(
       ethers.formatUnits(opened.args.collateral, dec)
     );
     const shares = Number(ethers.formatUnits(opened.args.shares, dec));
     const entryPrice = shares > 0 ? usedCollateral / shares : signal.price;
+
     db.prepare(
       `
       INSERT INTO copy_trades (
@@ -279,7 +336,7 @@ async function copyForUser(wallet, signal, dec) {
       signal.window ?? "",
       signal.side,
       shares,
-      usedCollateral, // from event, not pre-tx estimate
+      usedCollateral,
       entryPrice,
       receipt.hash,
       signal.signalId ?? null,
@@ -302,7 +359,6 @@ async function copyForUser(wallet, signal, dec) {
       `opened position ${positionId} for ${wallet}: ${collateral} on ${signal.symbol}`
     );
   } catch (e) {
-    // now catches EVERYTHING — precision throws, contract reverts, ABI mismatches
     log(
       "signal",
       `copyForUser failed for ${wallet} on ${signal.symbol}: ${
@@ -334,10 +390,6 @@ async function handleSignal(signal) {
 }
 
 // ── Settlement handling ─────────────────────────────────────────────
-// Driven by the bot's push (POST /api/settlement) rather than any polling
-// of chain state — this service has no ec-core access to read market
-// resolution itself, so it trusts the bot's own settlement determination
-// and just scales it to each user's own position size.
 async function handleSettlement(settlement) {
   if (settlement.dryRun) {
     log(
@@ -365,37 +417,39 @@ async function handleSettlement(settlement) {
     operatorWallet
   );
   const allowance = await token.allowance(
-    operatorWallet.address,
+    rawWallet.address,
     VAULT_ADDRESS
   );
   if (allowance < ethers.MaxUint256 / 2n) {
-    await (await token.approve(VAULT_ADDRESS, ethers.MaxUint256)).wait();
+    const approveTx = await executeTxWithRetry(() =>
+      token.approve(VAULT_ADDRESS, ethers.MaxUint256)
+    );
+    await approveTx.wait();
     log("settlement", `approved vault MaxUint256 for collateral pulls`);
   }
 
-  // ── redeem once per market before settling any position ──
-  // Only when there is something to redeem (WIN). LOSS has no pot.
-  // side: 0 = Yes, 1 = No — must match what was opened and the winning outcome.
+  // Redeem once per market before settling positions
   if (settlement.outcome === "WIN" || settlement.payoutPerShare > 0) {
     try {
-      // Prefer bot-supplied winning side if present; else derive from open trades
       const sideCode =
         settlement.winningSide === "BUY_NO" || settlement.winningSide === 1
           ? 1
-          : settlement.winningSide === "BUY_YES" || settlement.winningSide === 0
+          : settlement.winningSide === "BUY_YES" ||
+            settlement.winningSide === 0
           ? 0
           : open[0].side === "BUY_NO"
           ? 1
           : 0;
 
-      const redeemTx = await vault.redeemMarket(settlement.marketId, sideCode);
+      const redeemTx = await executeTxWithRetry(() =>
+        vault.redeemMarket(settlement.marketId, sideCode)
+      );
       const redeemReceipt = await redeemTx.wait();
       log(
         "settlement",
         `redeemMarket ${settlement.marketId} side=${sideCode} tx=${redeemReceipt.hash}`
       );
     } catch (e) {
-      // Non-fatal: settlePosition still works via operator wallet shortfall
       log(
         "settlement",
         `redeemMarket skipped/failed: ${e.shortMessage ?? e.message}`
@@ -411,7 +465,9 @@ async function handleSettlement(settlement) {
         dec
       );
 
-      const tx = await vault.settlePosition(trade.position_id, payoutRaw);
+      const tx = await executeTxWithRetry(() =>
+        vault.settlePosition(trade.position_id, payoutRaw)
+      );
       const receipt = await tx.wait();
       const settled = receipt.logs
         .map((l) => {
@@ -460,11 +516,6 @@ async function handleSettlement(settlement) {
         "settlement",
         `position ${trade.position_id} failed: ${e.shortMessage ?? e.message}`
       );
-      // leave as OPEN — a transient RPC/gas failure should retry on the next
-      // settlement push for this market, not permanently give up on real
-      // money. Note: since this only re-fires on another push for the SAME
-      // market, a failure here currently needs a manual retry or another
-      // bot-side push to recover — flagging as a follow-up, not solved yet.
     }
   }
 }
@@ -528,10 +579,6 @@ const routes = {
     return json(res, 202, { accepted: true });
   },
 
-  // Dashboard calls this once after the user's wallet tx (deposit/setTradeSize/
-  // setCopyEnabled) confirms client-side, so the backend knows this wallet
-  // exists to check on future signals. Does NOT sign or submit anything on
-  // the user's behalf.
   "POST /api/copy/register": async (req, res) => {
     const { wallet } = await readBody(req);
     if (!isAddress(wallet))
@@ -571,10 +618,10 @@ const routes = {
     });
   },
 
-"GET /api/copy/leaderboard": async (_req, res) => {
-  const rows = db
-    .prepare(
-      `
+  "GET /api/copy/leaderboard": async (_req, res) => {
+    const rows = db
+      .prepare(
+        `
     SELECT wallet_address,
            SUM(CASE WHEN status='SETTLED' THEN net_pnl ELSE 0 END) as pnl,
            SUM(CASE WHEN status='SETTLED' AND outcome='WIN' THEN 1 ELSE 0 END) as wins,
@@ -584,23 +631,23 @@ const routes = {
     ORDER BY pnl DESC
     LIMIT 50
   `
-    )
-    .all();
+      )
+      .all();
 
-  const { count } = db
-    .prepare(`SELECT COUNT(*) as count FROM users`)
-    .get();
+    const { count } = db
+      .prepare(`SELECT COUNT(*) as count FROM users`)
+      .get();
 
-  return json(res, 200, {
-    activeCopiers: count ?? 0,
-    leaderboard: rows.map((r) => ({
-      wallet: r.wallet_address,
-      pnl: r.pnl ?? 0,
-      winRate: r.settled ? r.wins / r.settled : null,
-      settledCount: r.settled,
-    })),
-  });
-},
+    return json(res, 200, {
+      activeCopiers: count ?? 0,
+      leaderboard: rows.map((r) => ({
+        wallet: r.wallet_address,
+        pnl: r.pnl ?? 0,
+        winRate: r.settled ? r.wins / r.settled : null,
+        settledCount: r.settled,
+      })),
+    });
+  },
 };
 
 const server = createServer(async (req, res) => {
@@ -625,5 +672,8 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   log("server", `listening on port ${PORT}`);
-  log("server", `vault: ${VAULT_ADDRESS}, operator: ${operatorWallet.address}`);
+  log(
+    "server",
+    `vault: ${VAULT_ADDRESS}, operator: ${rawWallet.address}`
+  );
 });
