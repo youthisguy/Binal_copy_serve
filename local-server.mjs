@@ -37,8 +37,6 @@ if (!WEBHOOK_SECRET) {
 }
 
 // ── Chain setup ─────────────────────────────────────────────────────
-// Matches the CURRENT deployed contract: struct-based openPositionFor,
-// 4-field accounts()/getAccount().
 const VAULT_ABI = [
   "function collateralToken() view returns (address)",
   "function accounts(address user) view returns (uint256 balance, uint256 lockedInTrades, bool copyEnabled, uint256 tradeSize)",
@@ -49,7 +47,51 @@ const VAULT_ABI = [
   "function openPositionFor((address user, bytes32 marketId, uint8 side, uint256 collateral, address pool, address outcomeToken, uint256 yesId, uint256 noId, uint256 priceRaw, uint256 quantityRaw, uint64 expireTimestampNs) p) returns (uint256 positionId)",
   "event PositionOpened(uint256 indexed positionId, address indexed user, bytes32 marketId, uint8 side, uint256 collateral, uint256 shares)",
   "event PositionSettled(uint256 indexed positionId, address indexed user, uint256 payout, uint256 netPayout, uint256 fee)",
+  
+  // Custom Errors — Vault & Position validation
+  "error SlippageExceeded(uint256 maxPrice, uint256 actualPrice)",
+  "error PriceOutOfBounds(uint256 price, uint256 min, uint256 max)",
+  "error InsufficientLiquidity()",
+  "error OrderExceedsLimit()",
+  "error InvalidQuantityStep(uint256 qty, uint256 step)",
+  "error MarketExpired(uint256 timestamp)",
+  "error Unauthorized()",
+  "error BalanceTooLow(uint256 balance, uint256 required)",
+
+  // Custom Errors — Matching Engine / Execution
+  "error ImmediateOrCancelNoFill()",
+  "error OrderAlreadyExpired()",
+  "error FillOrKillNotFillable()",
+  "error PostOnlyWouldCross()",
+  "error SelfMatchCancelTaker()"
 ];
+
+/**
+ * Helper to decode custom contract errors from revert hex signatures.
+ */
+function parseRevertReason(err, contractInterface) {
+  const rawData =
+    err?.data ||
+    err?.error?.data ||
+    err?.payload?.data ||
+    err?.info?.error?.data ||
+    err?.receipt?.revertReason;
+
+  if (rawData && typeof rawData === "string") {
+    try {
+      const parsed = contractInterface.parseError(rawData);
+      if (parsed) {
+        return parsed.args.length > 0
+          ? `${parsed.name}(${parsed.args.join(", ")})`
+          : `${parsed.name}()`;
+      }
+    } catch {
+      return `Unknown Custom Error [Selector: ${rawData.slice(0, 10)}]`;
+    }
+  }
+
+  return err?.shortMessage ?? err?.message ?? "Execution reverted";
+}
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const rawWallet = new ethers.Wallet(OPERATOR_KEY, provider);
@@ -76,20 +118,12 @@ const log = (scope, s) =>
 // ── Transaction Queue & Retry Setup ─────────────────────────────────
 let txQueue = Promise.resolve();
 
-/**
- * Serializes transaction execution to prevent nonce desynchronization
- * during concurrent calls.
- */
 function queueTx(txFn) {
   const next = txQueue.then(() => txFn());
   txQueue = next.catch(() => {});
   return next;
 }
 
-/**
- * Wraps a transaction function in the broadcast queue with automatic
- * exponential backoff retry logic for transient RPC / network errors.
- */
 async function executeTxWithRetry(txFn, maxRetries = 3, initialDelayMs = 200) {
   return queueTx(async () => {
     let attempt = 0;
@@ -98,13 +132,28 @@ async function executeTxWithRetry(txFn, maxRetries = 3, initialDelayMs = 200) {
         return await txFn();
       } catch (err) {
         attempt++;
+
+        // Extract raw revert data if available
+        const rawData =
+          err?.data ||
+          err?.error?.data ||
+          err?.payload?.data ||
+          err?.info?.error?.data ||
+          err?.receipt?.revertReason;
+
         const isRevert =
           err.code === "CALL_EXCEPTION" ||
-          err.message?.includes("execution reverted");
+          err.message?.includes("execution reverted") ||
+          Boolean(rawData);
 
         // Fail fast on contract execution reverts or max retries
         if (attempt >= maxRetries || isRevert) {
           throw err;
+        }
+
+        // RESYNC NONCEMANAGER: Clear cached nonce gaps on RPC network errors
+        if (typeof operatorWallet.reset === "function") {
+          operatorWallet.reset();
         }
 
         const delay = initialDelayMs * Math.pow(2, attempt - 1);
@@ -198,10 +247,9 @@ function isValidWebhookSecret(req) {
 
 function rawPriceQty(price, quantity, dec) {
   const d = Number(dec);
-  // floor to QTY_STEP, then make sure we never go below one step
   let steppedQty = Math.floor(Number(quantity) / QTY_STEP) * QTY_STEP;
   if (steppedQty < QTY_STEP && Number(quantity) >= QTY_STEP * 0.5) {
-    steppedQty = QTY_STEP; // rescue near-misses
+    steppedQty = QTY_STEP;
   }
   const priceRaw = ethers.parseUnits(Number(price).toFixed(d), d);
   const quantityRaw = ethers.parseUnits(steppedQty.toFixed(d), d);
@@ -209,72 +257,32 @@ function rawPriceQty(price, quantity, dec) {
 }
 
 // ── Signal handling ─────────────────────────────────────────────────
-async function copyForUser(wallet, signal, dec) {
-  try {
-    const [balance, , copyEnabled, tradeSize] = await vault
-      .getAccount(wallet)
-      .catch((e) => {
-        log("signal", `getAccount failed for ${wallet}: ${e.message}`);
-        return [0n, 0n, false, 0n];
-      });
-    if (!copyEnabled) {
-      log("signal", `${wallet}: skip — copyEnabled is false`);
-      return;
-    }
-    const collateralRaw = tradeSize < balance ? tradeSize : balance;
-    if (collateralRaw <= 0n) {
-      log(
-        "signal",
-        `${wallet}: skip — zero collateral (balance=${balance}, tradeSize=${tradeSize})`
-      );
-      return;
-    }
+async function copyForUser(wallet, signal, dec, collateralRaw) {
+  if (!collateralRaw || collateralRaw <= 0n) return;
 
-    const collateral = Number(ethers.formatUnits(collateralRaw, dec));
-    const MAX_AGGRESSIVE_PRICE = Number(process.env.COPY_MAX_PRICE ?? 0.80);
-    const base = Number(signal.price);
+  const collateral = Number(ethers.formatUnits(collateralRaw, dec));
+  const MAX_AGGRESSIVE_PRICE = Number(process.env.COPY_MAX_PRICE ?? 0.99);
+  const basePrice = Number(signal.price);
 
-    if (base >= MAX_AGGRESSIVE_PRICE) {
-      log(
-        "signal",
-        `${wallet}: skip — base price ${base} already at/above cap ${MAX_AGGRESSIVE_PRICE}`
-      );
-      return;
-    }
+  if (basePrice >= MAX_AGGRESSIVE_PRICE) {
+    log("signal", `${wallet}: skip — base price ${basePrice} at/above cap ${MAX_AGGRESSIVE_PRICE}`);
+    return;
+  }
 
-    // Allow up to 0.10 (10%) slippage tolerance so larger trade sizes can fill without reverting
-    const MAX_SLIPPAGE_BUFFER = Number(
-      process.env.COPY_SLIPPAGE_BUFFER ?? 0.10
-    );
-    const buffer = Math.max(0.02, Math.min(MAX_SLIPPAGE_BUFFER, base * 0.10));
-    const aggressivePrice = Math.min(MAX_AGGRESSIVE_PRICE, base + buffer);
+  // 1. Initial attempt: Use signal.limitPrice if provided; fallback to basePrice + buffer
+  const defaultBufferPrice = basePrice + Math.max(0.02, basePrice * 0.25);
+  const initialLimitPrice = Number(signal.limitPrice ?? defaultBufferPrice);
+  const targetPrice = Math.min(MAX_AGGRESSIVE_PRICE, initialLimitPrice);
 
-    const quantity = collateral / aggressivePrice;
-    const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(
-      aggressivePrice,
-      quantity,
-      dec
-    );
-    log(
-      "signal",
-      `${wallet}: trying open ${
-        signal.side
-      } ${steppedQty} @ ${aggressivePrice.toFixed(4)} ` +
-        `bot sent ${signal.price}, buffer +${buffer.toFixed(4)}) on ${
-          signal.symbol
-        }`
-    );
-    if (steppedQty <= 0) {
-      log(
-        "signal",
-        `${wallet}: skip — steppedQty ${steppedQty} <= 0 (collateral=${collateral}, price=${signal.price})`
-      );
-      return;
-    }
+  // Helper to submit transaction
+  const submitOpen = async (priceToUse) => {
+    const quantity = collateral / priceToUse;
+    const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(priceToUse, quantity, dec);
+
+    if (steppedQty <= 0) throw new Error("steppedQty <= 0");
 
     const sideCode = signal.side === "BUY_YES" ? 0 : 1;
 
-    // Queue transaction submission and execute with retry
     const tx = await executeTxWithRetry(() =>
       vault.openPositionFor({
         user: wallet,
@@ -294,40 +302,50 @@ async function copyForUser(wallet, signal, dec) {
       })
     );
 
-    // Mining wait runs outside mutex lock (concurrent across users)
-    const receipt = await tx.wait();
+    return await tx.wait();
+  };
 
+  try {
+    let receipt;
+    try {
+      // First Attempt
+      receipt = await submitOpen(targetPrice);
+    } catch (firstErr) {
+      const reason = parseRevertReason(firstErr, vault.interface);
+
+      // 2. If IOC failed due to no fill, ESCALATE to MAX_AGGRESSIVE_PRICE and retry immediately
+      if (reason.includes("ImmediateOrCancelNoFill")) {
+        log(
+          "signal",
+          `${wallet}: IOC zero-fill at ${targetPrice.toFixed(4)}. Escalating to max cap (${MAX_AGGRESSIVE_PRICE}) and retrying...`
+        );
+        receipt = await submitOpen(MAX_AGGRESSIVE_PRICE);
+      } else {
+        throw firstErr; // Re-throw non-liquidity errors (e.g., BalanceTooLow)
+      }
+    }
+
+    // Process confirmed transaction
     const opened = receipt.logs
       .map((l) => {
-        try {
-          return vault.interface.parseLog(l);
-        } catch {
-          return null;
-        }
+        try { return vault.interface.parseLog(l); } catch { return null; }
       })
       .find((e) => e?.name === "PositionOpened");
 
-    if (!opened)
-      throw new Error(
-        `tx ${receipt.hash} confirmed but no PositionOpened event`
-      );
+    if (!opened) throw new Error(`tx ${receipt.hash} confirmed but missing PositionOpened event`);
 
     const positionId = Number(opened.args.positionId);
-    const usedCollateral = Number(
-      ethers.formatUnits(opened.args.collateral, dec)
-    );
+    const usedCollateral = Number(ethers.formatUnits(opened.args.collateral, dec));
     const shares = Number(ethers.formatUnits(opened.args.shares, dec));
-    const entryPrice = shares > 0 ? usedCollateral / shares : signal.price;
+    const entryPrice = shares > 0 ? usedCollateral / shares : basePrice;
 
-    db.prepare(
-      `
+    db.prepare(`
       INSERT INTO copy_trades (
         position_id, wallet_address, market_id, symbol, asset, window, side,
         shares, collateral_at_entry, entry_price, tx_hash, status,
         source_signal_id, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
-    `
-    ).run(
+    `).run(
       positionId,
       wallet,
       signal.marketId,
@@ -343,28 +361,12 @@ async function copyForUser(wallet, signal, dec) {
       Date.now()
     );
 
-    recordEvent(
-      wallet,
-      "position_opened",
-      {
-        positionId,
-        marketId: signal.marketId,
-        collateral: usedCollateral,
-        shares,
-      },
-      receipt.hash
-    );
-    log(
-      "signal",
-      `opened position ${positionId} for ${wallet}: ${collateral} on ${signal.symbol}`
-    );
+    recordEvent(wallet, "position_opened", { positionId, marketId: signal.marketId, collateral: usedCollateral, shares }, receipt.hash);
+    log("signal", `opened position ${positionId} for ${wallet}: ${collateral} on ${signal.symbol}`);
+
   } catch (e) {
-    log(
-      "signal",
-      `copyForUser failed for ${wallet} on ${signal.symbol}: ${
-        e.shortMessage ?? e.message
-      }`
-    );
+    const reason = parseRevertReason(e, vault.interface);
+    log("signal", `copyForUser failed for ${wallet} on ${signal.symbol}: ${reason}`);
   }
 }
 
@@ -386,7 +388,84 @@ async function handleSignal(signal) {
     "signal",
     `${signal.symbol} ${signal.side} — checking ${wallets.length} known wallet(s)`
   );
-  await Promise.allSettled(wallets.map((w) => copyForUser(w, signal, dec)));
+
+  // 1. Pre-fetch account states in parallel
+  const userAccounts = await Promise.all(
+    wallets.map(async (w) => {
+      const [balance, , copyEnabled, tradeSize] = await vault
+        .getAccount(w)
+        .catch((e) => {
+          log("signal", `getAccount failed for ${w}: ${e.message}`);
+          return [0n, 0n, false, 0n];
+        });
+
+      if (!copyEnabled) return null;
+
+      const rawCollateral = tradeSize < balance ? tradeSize : balance;
+      if (rawCollateral <= 0n) return null;
+
+      return {
+        wallet: w,
+        collateralRaw: rawCollateral,
+      };
+    })
+  );
+
+  // Filter out null / zero balance copiers
+  let eligible = userAccounts.filter((u) => u !== null);
+
+  if (eligible.length === 0) {
+    log("signal", `${signal.symbol}: no eligible copiers with available collateral`);
+    return;
+  }
+
+  // 2. Sort by ascending trade collateral size (smaller sizes filled first)
+  eligible.sort((a, b) =>
+    a.collateralRaw < b.collateralRaw ? -1 : a.collateralRaw > b.collateralRaw ? 1 : 0
+  );
+
+  // 3. Cap aggregate collateral vs book/max limit
+  const envMaxAgg = process.env.COPY_MAX_AGGREGATE_COLLATERAL;
+  const maxAggregateCollateral =
+    typeof signal.maxAggregateCollateral === "number"
+      ? signal.maxAggregateCollateral
+      : envMaxAgg
+      ? Number(envMaxAgg)
+      : null;
+
+  const totalRequestedCollateral = eligible.reduce(
+    (sum, item) => sum + Number(ethers.formatUnits(item.collateralRaw, dec)),
+    0
+  );
+
+  let scaleFactor = 1.0;
+  if (maxAggregateCollateral && totalRequestedCollateral > maxAggregateCollateral) {
+    scaleFactor = maxAggregateCollateral / totalRequestedCollateral;
+    log(
+      "signal",
+      `Aggregate size (${totalRequestedCollateral.toFixed(
+        2
+      )}) exceeds limit (${maxAggregateCollateral.toFixed(
+        2
+      )}). Scaling per-user size by ${(scaleFactor * 100).toFixed(1)}%`
+    );
+  }
+
+  // 4. Serialize opens sequentially
+  for (const item of eligible) {
+    let finalCollateralRaw = item.collateralRaw;
+
+    if (scaleFactor < 1.0) {
+      const scaledCollateral =
+        Number(ethers.formatUnits(item.collateralRaw, dec)) * scaleFactor;
+      finalCollateralRaw = ethers.parseUnits(
+        scaledCollateral.toFixed(dec),
+        dec
+      );
+    }
+
+    await copyForUser(item.wallet, signal, dec, finalCollateralRaw);
+  }
 }
 
 // ── Settlement handling ─────────────────────────────────────────────
@@ -406,7 +485,6 @@ async function handleSettlement(settlement) {
   if (open.length === 0) return;
   const dec = await decimals();
 
-  // Pre-approve once
   const tokenAddr = await vault.collateralToken();
   const token = new ethers.Contract(
     tokenAddr,
@@ -428,7 +506,6 @@ async function handleSettlement(settlement) {
     log("settlement", `approved vault MaxUint256 for collateral pulls`);
   }
 
-  // Redeem once per market before settling positions
   if (settlement.outcome === "WIN" || settlement.payoutPerShare > 0) {
     try {
       const sideCode =
@@ -528,9 +605,16 @@ function json(res, status, body) {
   });
   res.end(JSON.stringify(body));
 }
-async function readBody(req) {
+async function readBody(req, maxBytes = 100_000) {
+  let size = 0;
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  for await (const c of req) {
+    size += c.length;
+    if (size > maxBytes) {
+      throw new Error("Payload size exceeds limit");
+    }
+    chunks.push(c);
+  }
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
 }
 function isAddress(a) {
