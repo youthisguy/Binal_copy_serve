@@ -60,6 +60,11 @@ const VAULT_ABI = [
   "error Unauthorized()",
   "error BalanceTooLow(uint256 balance, uint256 required)",
 
+  // Custom Errors — Pool, Oracle & Market Resolution
+  "error MarketNotResolved()",
+  "error OraclePending()",
+  "error AlreadyRedeemed()",
+
   // Custom Errors — Matching Engine / Execution
   "error ImmediateOrCancelNoFill()",
   "error OrderAlreadyExpired()",
@@ -625,12 +630,43 @@ async function handleSettlement(settlement) {
     );
     return;
   }
+
+  // 1. Flexible market identifier extraction
+  const targetMarket =
+    settlement.marketId ||
+    settlement.market_id ||
+    settlement.market ||
+    settlement.symbol;
+
+  if (!targetMarket) {
+    log("settlement", "Settlement failed: missing market identifier in payload.");
+    return;
+  }
+
+  log("settlement", `Received settlement webhook for: "${targetMarket}"`);
+
+  // 2. Case-insensitive lookup across both market_id AND symbol columns
   const open = db
     .prepare(
-      `SELECT * FROM copy_trades WHERE market_id = ? AND status = 'OPEN'`
+      `SELECT * FROM copy_trades 
+       WHERE (LOWER(market_id) = LOWER(?) OR LOWER(symbol) = LOWER(?)) 
+         AND status = 'OPEN'`
     )
-    .all(settlement.marketId);
-  if (open.length === 0) return;
+    .all(targetMarket, targetMarket);
+
+  if (open.length === 0) {
+    log(
+      "settlement",
+      `No open positions found in DB matching market/symbol: "${targetMarket}". Skipped.`
+    );
+    return;
+  }
+
+  log(
+    "settlement",
+    `Found ${open.length} open position(s) to settle for "${targetMarket}".`
+  );
+
   const dec = await decimals();
 
   const tokenAddr = await vault.collateralToken();
@@ -651,33 +687,47 @@ async function handleSettlement(settlement) {
     log("settlement", `approved vault MaxUint256 for collateral pulls`);
   }
 
+  // 3. Retry redeemMarket with delay if Oracle is lagging
   if (settlement.outcome === "WIN" || settlement.payoutPerShare > 0) {
-    try {
-      const sideCode =
-        settlement.winningSide === "BUY_NO" || settlement.winningSide === 1
-          ? 1
-          : settlement.winningSide === "BUY_YES" || settlement.winningSide === 0
-          ? 0
-          : open[0].side === "BUY_NO"
-          ? 1
-          : 0;
+    const sideCode =
+      settlement.winningSide === "BUY_NO" || settlement.winningSide === 1
+        ? 1
+        : settlement.winningSide === "BUY_YES" || settlement.winningSide === 0
+        ? 0
+        : open[0].side === "BUY_NO"
+        ? 1
+        : 0;
 
-      const redeemTx = await executeTxWithRetry(() =>
-        vault.redeemMarket(settlement.marketId, sideCode)
-      );
-      const redeemReceipt = await redeemTx.wait();
-      log(
-        "settlement",
-        `redeemMarket ${settlement.marketId} side=${sideCode} tx=${redeemReceipt.hash}`
-      );
-    } catch (e) {
-      log(
-        "settlement",
-        `redeemMarket skipped/failed: ${e.shortMessage ?? e.message}`
-      );
+    let redeemed = false;
+    const maxRedeemAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxRedeemAttempts; attempt++) {
+      try {
+        const redeemTx = await executeTxWithRetry(() =>
+          vault.redeemMarket(open[0].market_id, sideCode)
+        );
+        const redeemReceipt = await redeemTx.wait();
+        log(
+          "settlement",
+          `redeemMarket ${open[0].market_id} side=${sideCode} tx=${redeemReceipt.hash}`
+        );
+        redeemed = true;
+        break;
+      } catch (e) {
+        const parsedErr = parseRevertReason(e, vault.interface);
+        log(
+          "settlement",
+          `redeemMarket attempt ${attempt}/${maxRedeemAttempts} failed: ${parsedErr}`
+        );
+        if (attempt < maxRedeemAttempts) {
+          log("settlement", `Waiting 3s for oracle/market state before retrying redeemMarket...`);
+          await new Promise((r) => setTimeout(r, 3000));
+        }
+      }
     }
   }
 
+  // 4. Settle each user's trade
   for (const trade of open) {
     try {
       const payout = trade.shares * settlement.payoutPerShare;
@@ -733,9 +783,10 @@ async function handleSettlement(settlement) {
         } ${netPnl.toFixed(3)}`
       );
     } catch (e) {
+      const parsedErr = parseRevertReason(e, vault.interface);
       log(
         "settlement",
-        `position ${trade.position_id} failed: ${e.shortMessage ?? e.message}`
+        `position ${trade.position_id} failed: ${parsedErr}`
       );
     }
   }
@@ -785,7 +836,7 @@ const routes = {
     return json(res, 202, { accepted: true });
   },
 
-  "POST /api/settlement": async (req, res) => {
+"POST /api/settlement": async (req, res) => {
     if (!isValidWebhookSecret(req)) {
       log(
         "settlement",
@@ -794,13 +845,21 @@ const routes = {
       return json(res, 401, { error: "unauthorized" });
     }
     const settlement = await readBody(req);
+    
+    // Check for any valid market identifier key
+    const targetMarket =
+      settlement.marketId ||
+      settlement.market_id ||
+      settlement.market ||
+      settlement.symbol;
     if (
-      !settlement.marketId ||
+      !targetMarket ||
       !settlement.outcome ||
       typeof settlement.payoutPerShare !== "number"
     ) {
       return json(res, 400, { error: "invalid settlement payload" });
     }
+    
     handleSettlement(settlement).catch((e) =>
       log("settlement", `handleSettlement error: ${e.message}`)
     );
@@ -874,6 +933,17 @@ const routes = {
       })),
     });
   },
+
+  "GET /api/copy/open-trades": async (_req, res) => {
+    const openTrades = db
+      .prepare(
+        `SELECT position_id, wallet_address, market_id, symbol, side, status, created_at 
+         FROM copy_trades 
+         WHERE status = 'OPEN'`
+      )
+      .all();
+    return json(res, 200, { count: openTrades.length, openTrades });
+  },
 };
 
 const server = createServer(async (req, res) => {
@@ -899,4 +969,18 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, () => {
   log("server", `listening on port ${PORT}`);
   log("server", `vault: ${VAULT_ADDRESS}, operator: ${rawWallet.address}`);
+  
+  // Background interval to report stuck OPEN trades
+  setInterval(() => {
+    try {
+      const stuck = db
+        .prepare(`SELECT position_id, symbol, market_id FROM copy_trades WHERE status = 'OPEN'`)
+        .all();
+      if (stuck.length > 0) {
+        log("cron", `Notice: ${stuck.length} unsettled OPEN trade(s) currently in DB.`);
+      }
+    } catch (e) {
+      log("cron", `Background check error: ${e.message}`);
+    }
+  }, 60_000);
 });
