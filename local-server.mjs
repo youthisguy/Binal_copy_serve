@@ -23,6 +23,8 @@ const PORT = Number(process.env.PORT ?? process.env.COPY_API_PORT ?? 8788);
 const DB_PATH = process.env.COPY_DB_PATH ?? "copy-trade.db";
 const QTY_STEP = Number(process.env.COPY_QTY_STEP ?? 0.01);
 const WEBHOOK_SECRET = process.env.COPY_WEBHOOK_SECRET;
+const POLL_INTERVAL_MS = 3_000; // Check order book every 3 seconds
+const CUTOFF_BUFFER_MS = 3 * 60 * 1000; // Stop 3 minutes before expiry
 
 if (!RPC_URL || !VAULT_ADDRESS || !OPERATOR_KEY) {
   console.error(
@@ -283,23 +285,41 @@ function rawPriceQty(price, quantity, dec) {
 async function copyForUser(wallet, signal, dec, collateralRaw) {
   if (!collateralRaw || collateralRaw <= 0n) return;
 
-  const MAX_AGGRESSIVE_PRICE = Number(process.env.COPY_MAX_PRICE ?? 0.99);
-  const basePrice = Number(signal.price);
+  const MAX_SIGNAL_AGE_MS = 6 * 60 * 1000; // Hard TTL limit (6 minutes from signal creation)
+  const ABSOLUTE_MAX_PRICE = 0.9; // Never fill higher than 0.90 (capped against drift)
 
-  if (basePrice >= MAX_AGGRESSIVE_PRICE) {
+  const basePrice = Number(signal.price);
+  const signalTimestamp = Number(signal.timestamp ?? Date.now());
+
+  // 1. Cap maximum aggressive price at 0.90
+  const maxPriceCap = Math.min(
+    Number(process.env.COPY_MAX_PRICE ?? ABSOLUTE_MAX_PRICE),
+    ABSOLUTE_MAX_PRICE
+  );
+
+  if (basePrice >= maxPriceCap) {
     log(
       "signal",
-      `${wallet}: skip — base price ${basePrice} at/above cap ${MAX_AGGRESSIVE_PRICE}`
+      `${wallet}: skip — base price ${basePrice} is at or above cap ${maxPriceCap}`
     );
     return;
   }
 
-  // 1. Initial target price buffer
+  // 2. Initial signal freshness check
+  if (Date.now() - signalTimestamp > MAX_SIGNAL_AGE_MS) {
+    log("signal", `${wallet}: skip — signal is stale`);
+    return;
+  }
+
+  // 3. Setup window expiry and cutoff window (defaults to 15m window)
+  const expiryMs = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
+  const cutoffTimestamp = expiryMs - CUTOFF_BUFFER_MS;
+
   const defaultBufferPrice = basePrice + Math.max(0.02, basePrice * 0.25);
   const initialLimitPrice = Number(signal.limitPrice ?? defaultBufferPrice);
-  const targetPrice = Math.min(MAX_AGGRESSIVE_PRICE, initialLimitPrice);
+  const targetPrice = Math.min(maxPriceCap, initialLimitPrice);
 
-  // 2. Define the 3-Step Attempt Ladder
+  // 3-Step Sizing Ladder (prices guaranteed <= 0.90)
   const attempts = [
     {
       price: targetPrice,
@@ -307,153 +327,183 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
       label: `100% @ ${targetPrice.toFixed(4)}`,
     },
     {
-      price: MAX_AGGRESSIVE_PRICE,
+      price: maxPriceCap,
       scale: 0.75,
-      label: `75% @ ${MAX_AGGRESSIVE_PRICE}`,
+      label: `75% @ ${maxPriceCap.toFixed(2)}`,
     },
     {
-      price: MAX_AGGRESSIVE_PRICE,
+      price: maxPriceCap,
       scale: 0.5,
-      label: `50% @ ${MAX_AGGRESSIVE_PRICE}`,
+      label: `50% @ ${maxPriceCap.toFixed(2)}`,
     },
   ];
 
-  const submitOpen = async (priceToUse, colRaw) => {
-    const colNum = Number(ethers.formatUnits(colRaw, dec));
-    const quantity = colNum / priceToUse;
-    const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(
-      priceToUse,
-      quantity,
-      dec
-    );
+  // 4. Polling loop: Runs until 2 mins before expiry or until TTL breaches
+  while (Date.now() < cutoffTimestamp) {
+    // Abandon if loop exceeds 2-minute signal TTL
+    if (Date.now() - signalTimestamp > MAX_SIGNAL_AGE_MS) {
+      log(
+        "signal",
+        `${wallet}: abandoned retry loop — reached TTL limit for ${signal.symbol}`
+      );
+      return;
+    }
 
-    if (steppedQty <= 0) throw new Error("steppedQty <= 0");
+    for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i];
 
-    const sideCode = signal.side === "BUY_YES" ? 0 : 1;
+      // Double guard: Skip tier if calculated target exceeds 0.90
+      if (attempt.price > ABSOLUTE_MAX_PRICE) continue;
 
-    const tx = await executeTxWithRetry(() =>
-      vault.openPositionFor({
+      const currentColRaw =
+        (collateralRaw * BigInt(Math.round(attempt.scale * 100))) / 100n;
+
+      if (currentColRaw <= 0n) break;
+
+      const colNum = Number(ethers.formatUnits(currentColRaw, dec));
+      const quantity = colNum / attempt.price;
+      const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(
+        attempt.price,
+        quantity,
+        dec
+      );
+
+      if (steppedQty <= 0) continue;
+
+      const sideCode = signal.side === "BUY_YES" ? 0 : 1;
+      const openParams = {
         user: wallet,
         marketId: signal.marketId,
         side: sideCode,
-        collateral: colRaw,
+        collateral: currentColRaw,
         pool: signal.pool,
         outcomeToken: ethers.ZeroAddress,
         yesId: 0,
         noId: 0,
         priceRaw,
         quantityRaw,
-        expireTimestampNs: (() => {
-          const ms = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
-          return BigInt(Math.floor(ms / 1000)) * 1_000_000_000n;
-        })(),
-      })
-    );
+        expireTimestampNs: BigInt(Math.floor(expiryMs / 1000)) * 1_000_000_000n,
+      };
 
-    return await tx.wait();
-  };
+      // Step A & B: SIMULATE IN QUEUE, BROADCAST, AND WAIT FOR MINED BLOCK
+      let receipt;
+      let opened;
 
-  // 3. Execute Attempt Ladder
-  for (let i = 0; i < attempts.length; i++) {
-    const attempt = attempts[i];
-    const currentColRaw =
-      (collateralRaw * BigInt(Math.round(attempt.scale * 100))) / 100n;
+      try {
+        const result = await executeTxWithRetry(async () => {
+          // 1. Off-chain probe inside serial queue
+          await vault.openPositionFor.staticCall(openParams);
+          // 2. Broadcast transaction
+          const tx = await vault.openPositionFor(openParams);
+          // 3. Wait for block inclusion INSIDE queue so chain state updates for next user
+          const rx = await tx.wait();
+          return { tx, rx };
+        });
 
-    if (currentColRaw <= 0n) break;
+        receipt = result.rx;
 
-    try {
-      const receipt = await submitOpen(attempt.price, currentColRaw);
+        opened = receipt.logs
+          .map((l) => {
+            try {
+              return vault.interface.parseLog(l);
+            } catch {
+              return null;
+            }
+          })
+          .find((e) => e?.name === "PositionOpened");
 
-      const opened = receipt.logs
-        .map((l) => {
-          try {
-            return vault.interface.parseLog(l);
-          } catch {
-            return null;
-          }
-        })
-        .find((e) => e?.name === "PositionOpened");
+        if (!opened) {
+          throw new Error(
+            `tx ${receipt.hash} confirmed but missing PositionOpened event`
+          );
+        }
+      } catch (err) {
+        // If the error has a receipt or transactionHash, it was broadcast and reverted on-chain
+        if (err.receipt || err.transactionHash) {
+          log(
+            "signal",
+            `${wallet}: tx execution failed on-chain: ${
+              err.shortMessage ?? err.message
+            }`
+          );
+          return; // Stop retrying for this user on actual on-chain revert
+        }
 
-      if (!opened)
-        throw new Error(
-          `tx ${receipt.hash} confirmed but missing PositionOpened event`
+        // Otherwise, staticCall probe rejected off-chain (no liquidity at this tier)
+        // Move to the next fallback size tier or wait for the next 3s poll tick
+        continue;
+      }
+
+      // Step C: RECORD IN DB — On-chain transaction succeeded
+
+      try {
+        const positionId = Number(opened.args.positionId);
+        const usedCollateral = Number(
+          ethers.formatUnits(opened.args.collateral, dec)
+        );
+        const shares = Number(ethers.formatUnits(opened.args.shares, dec));
+        const entryPrice = shares > 0 ? usedCollateral / shares : basePrice;
+
+        db.prepare(
+          `
+          INSERT INTO copy_trades (
+            position_id, wallet_address, market_id, symbol, asset, window, side,
+            shares, collateral_at_entry, entry_price, tx_hash, status,
+            source_signal_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+        `
+        ).run(
+          positionId,
+          wallet,
+          signal.marketId,
+          signal.symbol ?? "",
+          signal.asset ?? "",
+          signal.window ?? "",
+          signal.side,
+          shares,
+          usedCollateral,
+          entryPrice,
+          receipt.hash,
+          signal.signalId ?? null,
+          Date.now()
         );
 
-      const positionId = Number(opened.args.positionId);
-      const usedCollateral = Number(
-        ethers.formatUnits(opened.args.collateral, dec)
-      );
-      const shares = Number(ethers.formatUnits(opened.args.shares, dec));
-      const entryPrice = shares > 0 ? usedCollateral / shares : basePrice;
+        recordEvent(
+          wallet,
+          "position_opened",
+          {
+            positionId,
+            marketId: signal.marketId,
+            collateral: usedCollateral,
+            shares,
+          },
+          receipt.hash
+        );
 
-      db.prepare(
-        `
-        INSERT INTO copy_trades (
-          position_id, wallet_address, market_id, symbol, asset, window, side,
-          shares, collateral_at_entry, entry_price, tx_hash, status,
-          source_signal_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
-      `
-      ).run(
-        positionId,
-        wallet,
-        signal.marketId,
-        signal.symbol ?? "",
-        signal.asset ?? "",
-        signal.window ?? "",
-        signal.side,
-        shares,
-        usedCollateral,
-        entryPrice,
-        receipt.hash,
-        signal.signalId ?? null,
-        Date.now()
-      );
-
-      recordEvent(
-        wallet,
-        "position_opened",
-        {
-          positionId,
-          marketId: signal.marketId,
-          collateral: usedCollateral,
-          shares,
-        },
-        receipt.hash
-      );
-      log(
-        "signal",
-        `opened position ${positionId} for ${wallet}: ${usedCollateral.toFixed(
-          2
-        )} collateral (${attempt.label}) on ${signal.symbol}`
-      );
-      return; // Filled successfully — exit ladder
-    } catch (err) {
-      const rawHex = extractRevertData(err);
-
-      const reason = parseRevertReason(err, vault.interface);
-
-      log(
-        "signal",
-        `${wallet}: attempt ${i + 1}/${attempts.length} failed (${
-          attempt.label
-        }) — raw=${rawHex ?? "none"} reason=${reason}`
-      );
-
-      const isLiquidityOrPriceError =
-        reason.includes("ImmediateOrCancelNoFill") ||
-        reason.includes("SlippageExceeded") ||
-        reason.includes("InsufficientLiquidity") ||
-        rawHex === "0xd48c4403" ||
-        reason.includes("unknown custom error") ||
-        reason.includes("Unknown Custom Error");
-
-      // Stop retrying non-liquidity errors (e.g., BalanceTooLow, Unauthorized)
-      if (!isLiquidityOrPriceError) {
-        break;
+        log(
+          "signal",
+          `opened position ${positionId} for ${wallet}: ${usedCollateral.toFixed(
+            2
+          )} collateral (${attempt.label}) on ${signal.symbol}`
+        );
+      } catch (dbErr) {
+        log(
+          "signal",
+          `CRITICAL: Position opened on-chain (tx: ${receipt.hash}) but DB write failed: ${dbErr.message}`
+        );
       }
+
+      return; // Fill completed — terminate loop
     }
+
+    // Wait 3s before probing order book liquidity again
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
+
+  log(
+    "signal",
+    `${wallet}: retry window closed for ${signal.symbol} (reached 3m expiry cutoff)`
+  );
 }
 
 async function handleSignal(signal) {
@@ -548,20 +598,22 @@ async function handleSignal(signal) {
   }
 
   // 4. Serialize opens sequentially
-  for (const item of eligible) {
-    let finalCollateralRaw = item.collateralRaw;
+  await Promise.allSettled(
+    eligible.map((item) => {
+      let finalCollateralRaw = item.collateralRaw;
 
-    if (scaleFactor < 1.0) {
-      const scaledCollateral =
-        Number(ethers.formatUnits(item.collateralRaw, dec)) * scaleFactor;
-      finalCollateralRaw = ethers.parseUnits(
-        scaledCollateral.toFixed(dec),
-        dec
-      );
-    }
+      if (scaleFactor < 1.0) {
+        const scaledCollateral =
+          Number(ethers.formatUnits(item.collateralRaw, dec)) * scaleFactor;
+        finalCollateralRaw = ethers.parseUnits(
+          scaledCollateral.toFixed(dec),
+          dec
+        );
+      }
 
-    await copyForUser(item.wallet, signal, dec, finalCollateralRaw);
-  }
+      return copyForUser(item.wallet, signal, dec, finalCollateralRaw);
+    })
+  );
 }
 
 // ── Settlement handling ─────────────────────────────────────────────
@@ -829,7 +881,7 @@ const server = createServer(async (req, res) => {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, x-webhook-secret",
     });
     return res.end();
   }

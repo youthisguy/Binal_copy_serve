@@ -11,9 +11,9 @@ Users keep custody of funds in **CopyVault**. The main bot only provides signal 
 ## What this service does
 
 1. Accepts `POST /api/signal` from the main bot when Binal opens a trade.
-2. For each registered wallet that is copy-enabled on-chain with idle balance, calls `openPositionFor` as the operator.
+2. For each registered, copy-enabled wallet, executes sequential fills using **off-chain liquidity probing**, a **3-tier sizing ladder**, and a **polling retry loop**.
 3. Accepts `POST /api/settlement` when a market resolves.
-4. calls `redeemMarket` into a per-market collateral pot.
+4. Calls `redeemMarket` into a per-market collateral pot.
 5. Calls `settlePosition` per open copy.
 6. Serves read APIs for the copy client: on-chain balances plus SQLite-backed history and a leaderboard.
 
@@ -24,23 +24,61 @@ It does **not** compute edge, scan markets, or talk to `ec-core`. Pool address, 
 ## Architecture
 
 ```
-Binal Bot                    Copy service                 Chain
-─────────                    ────────────                 ─────
-placeLimit (bot's own trade)
+Binal Bot                    Copy service                                 Chain
+─────────                    ────────────                                 ─────
+placeLimit (bot's trade)
 notifyCopyService     ─────▶ POST /api/signal
-                              openPositionFor    ─────────▶ CopyVault → BinaryPool
-notifyCopySettlement   ─────▶ POST /api/settlement
-                              redeemMarket       ─────────▶ Router.redeemNative
-                              settlePosition     ─────────▶ CopyVault (pot / operator)
-copy-trade.html        ◀───  GET /api/copy/me | /leaderboard
-                        ────▶ deposit / withdraw / setTradeSize / setCopyEnabled
+                              │
+                              ├──► Pre-fetch accounts & sort (smallest first)
+                              ├──► Scale per-user size if aggregate capped
+                              └──► Serial Tx Queue (txQueue)
+                                     ├── staticCall probe (off-chain)
+                                     ├── openPositionFor  ───────────────▶ CopyVault → BinaryPool
+                                     └── tx.wait() (block inclusion)
+
+notifyCopySettlement  ─────▶ POST /api/settlement
+                              redeemMarket               ───────────────▶ Router.redeemNative
+                              settlePosition              ───────────────▶ CopyVault (pot / operator)
+
+copy-trade.html       ◀───   GET /api/copy/me | /leaderboard
+                       ────▶  deposit / withdraw / setTradeSize / setCopyEnabled
 ```
 
 | Component | Role |
 |---|---|
 | `CopyVault.sol` | Per-user balances; operator open/settle/redeem; fee on profit only |
-| `local-server.mjs` | Webhooks, operator transactions, SQLite, public read API |
+| `local-server.mjs` / `server.ts` | Webhooks, queue execution, liquidity probing, operator transactions, SQLite, public read API |
 | `copy-trade.html` | Wallet UI, usually hosted alongside the main dashboard |
+
+---
+
+## Signal Execution & Queue Engine
+
+To ensure execution reliability, zero gas waste from reverts, and fair fills across all copiers, the service implements a structured execution pipeline:
+
+### 1. Account Sorting & Aggregate Scaling
+
+- **Ascending Size Execution:** Eligible copiers are sorted in ascending order by trade collateral. Smaller accounts fill first before order book depth is consumed.
+- **Aggregate Cap Scaling:** If total user collateral exceeds `COPY_MAX_AGGREGATE_COLLATERAL` (or `signal.maxAggregateCollateral`), all user position sizes are scaled down proportionally.
+
+### 2. Off-Chain Liquidity Probing (`staticCall`) & Fallback Ladder
+
+Before broadcasting any transaction on-chain, the service simulates `openPositionFor.staticCall()` inside the execution queue. If order book liquidity is insufficient, `staticCall` reverts off-chain without spending gas.
+
+If probed liquidity fails at full target size, the engine steps down through a 3-tier fallback ladder:
+
+- **Tier 1:** 100% trade size @ calculated target price
+- **Tier 2:** 75% trade size @ maximum capped price (`0.90`)
+- **Tier 3:** 50% trade size @ maximum capped price (`0.90`)
+
+### 3. Polling Retry Loop & Time-To-Live (TTL)
+
+- **Polling:** If all size tiers fail due to order book illiquidity, the engine waits **3 seconds** before re-probing.
+- **Cutoff & TTL:** Retries continue until either 3 minutes before market expiry (`CUTOFF_BUFFER_MS`) or until the signal age reaches the **2-minute TTL limit**, whichever comes first.
+
+### 4. Serial Transaction Queue (`txQueue`) & Mempool Protection
+
+All execution transactions pass through a single-threaded queue. The queue holds its lock until `tx.wait()` completes (block inclusion). This guarantees that subsequent users evaluate their `staticCall` probes against updated block states, eliminating mempool collisions and nonce races.
 
 ---
 
@@ -92,11 +130,13 @@ Fired by the bot after its own fill.
   "price": 0.55,
   "pool": "0x…",
   "expiryMs": 1730000000000,
+  "limitPrice": 0.65,
+  "maxAggregateCollateral": 500,
   "dryRun": false
 }
 ```
 
-Service behavior: load registered wallets → for each `copyEnabled` wallet with available collateral → `openPositionFor` → write a SQLite row.
+**Service behavior:** loads registered wallets → sorts ascending by size → executes through `txQueue` with off-chain `staticCall` probing and size ladder fallback → records SQLite row upon confirmation.
 
 ### `POST /api/settlement`
 
@@ -112,7 +152,7 @@ Service behavior: load registered wallets → for each `copyEnabled` wallet with
 
 `winningSide`: `0` = Yes, `1` = No (preferred). If omitted, the service falls back to the side of the first open trade on that market — only safe when every copy took the same side.
 
-Flow: approve the operator on the vault if needed → `redeemMarket` on `WIN`/positive payout (errors are logged, non-fatal) → `settlePosition` for each `OPEN` row on that market.
+**Flow:** approve the operator on the vault if needed → `redeemMarket` on WIN/positive payout (errors are logged, non-fatal) → `settlePosition` for each OPEN row on that market.
 
 ### User / dashboard
 
@@ -122,7 +162,7 @@ Flow: approve the operator on the vault if needed → `redeemMarket` on `WIN`/po
 | `GET` | `/api/copy/me?wallet=0x…` | On-chain account state plus recent trades and PnL |
 | `GET` | `/api/copy/leaderboard` | Ranked settled PnL across all users |
 
-Registering alone does nothing on-chain — deposit, set trade size, and enable copy on the deployed vault are still required.
+> Registering alone does nothing on-chain — deposit, set trade size, and enable copy on the deployed vault are still required.
 
 ---
 
@@ -131,12 +171,14 @@ Registering alone does nothing on-chain — deposit, set trade size, and enable 
 | Variable | Required | Meaning |
 |---|---|---|
 | `COPY_RPC_URL` | yes | RPC endpoint for the target network |
-| `COPY_VAULT_ADDRESS` | yes | Deployed `CopyVault` address |
+| `COPY_VAULT_ADDRESS` | yes | Deployed CopyVault address |
 | `COPY_BOT_OPERATOR_PRIVATE_KEY` | yes | Must match the vault's configured operator |
 | `COPY_WEBHOOK_SECRET` | yes | Shared with the main bot's `COPY_WEBHOOK_SECRET` |
 | `PORT` / `COPY_API_PORT` | no | Default `8788` (many hosts set `PORT` automatically) |
 | `COPY_DB_PATH` | no | SQLite path — point at a persistent disk in production |
 | `COPY_QTY_STEP` | no | Quantity rounding step, default `0.01` |
+| `COPY_MAX_PRICE` | no | Price cap ceiling, default `0.90` |
+| `COPY_MAX_AGGREGATE_COLLATERAL` | no | Global collateral allocation cap per signal across all copiers |
 
 ---
 
@@ -164,7 +206,7 @@ After deploying, set `COPY_VAULT_ADDRESS` and restart this service.
 npm install
 # Node 20.18.x recommended for better-sqlite3
 cp .env.example .env   # fill in the variables above
-node --env-file=.env local-server.mjs
+npm run start          # or node --env-file=.env local-server.mjs
 ```
 
 Health check: `GET http://localhost:8788/` → `{ "ok": true }`.
@@ -177,18 +219,18 @@ Health check: `GET http://localhost:8788/` → `{ "ok": true }`.
 2. Approve the vault and deposit.
 3. Set a trade size, then enable copy.
 4. The page registers the wallet via `POST /api/copy/register`.
-5. On each bot signal, the service may open a position for that wallet.
+5. On each bot signal, the service attempts position opens for that wallet.
 6. On settlement, idle balance updates — withdraw whenever desired.
 
 ---
 
 ## Operational notes
 
-- One operator key signs every open and settle transaction — prefer sequential opens per signal to avoid nonce races under load.
-- SQLite is ephemeral on most PaaS hosts; attach a persistent disk to keep history across redeploys.
-- Redeem depends on a correct router address, `venueId`, and `operatorId`. If redeem fails, settlement still proceeds via the operator's own collateral.
-- The vault records `shares = quantityRaw` under a full-fill assumption — keep position sizes small relative to book depth.
-- Webhooks are push-only. A downed service simply misses signals unless the bot itself retries.
+- **Execution Queue:** Single-threaded `txQueue` serializes execution and waits for block inclusion (`tx.wait()`), avoiding mempool state collisions and nonce desyncs.
+- **Gas Savings:** Off-chain `staticCall` simulations reject illiquid orders before broadcast, eliminating on-chain revert gas costs.
+- **Persistence:** SQLite is ephemeral on most PaaS hosts; attach a persistent disk to keep history across redeploys.
+- **Redeem Robustness:** Redeem depends on a correct router address, `venueId`, and `operatorId`. If redeem fails, settlement still proceeds via the operator's own collateral.
+- **Webhooks:** Webhooks are push-only. A downed service simply misses signals unless the bot itself retries.
 
 ---
 
@@ -203,6 +245,6 @@ Health check: `GET http://localhost:8788/` → `{ "ok": true }`.
 
 ## Status & disclaimer
 
-Intended for testnet validation and educational/hackathon use. **Not audited, not financial advice.** Copy trading can lose the full amount deposited. Deployment, keys, and parameters are your responsibility.
+Intended for testnet validation and educational/hackathon use. Not audited, not financial advice. Copy trading can lose the full amount deposited. Deployment, keys, and parameters are your responsibility.
 
 [DreamDEX docs](https://docs.dreamdex.io)
