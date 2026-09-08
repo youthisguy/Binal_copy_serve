@@ -24,7 +24,7 @@ const DB_PATH = process.env.COPY_DB_PATH ?? "copy-trade.db";
 const QTY_STEP = Number(process.env.COPY_QTY_STEP ?? 0.01);
 const WEBHOOK_SECRET = process.env.COPY_WEBHOOK_SECRET;
 const POLL_INTERVAL_MS = 3_000; // Check order book every 3 seconds
-const CUTOFF_BUFFER_MS = 3 * 60 * 1000; // Stop 3 minutes before expiry
+const CUTOFF_BUFFER_MS = 1 * 60 * 1000; // Stop 1 minutes before expiry
 
 if (!RPC_URL || !VAULT_ADDRESS || !OPERATOR_KEY) {
   console.error(
@@ -149,54 +149,64 @@ const log = (scope, s) =>
 let txQueue = Promise.resolve();
 
 function queueTx(txFn) {
-  const next = txQueue.then(() => txFn());
-  txQueue = next.catch(() => {});
+  const next = txQueue.then(() => txFn()).catch(() => {});
+  txQueue = next;
   return next;
 }
 
 async function executeTxWithRetry(txFn, maxRetries = 3, initialDelayMs = 200) {
-  return queueTx(async () => {
-    let attempt = 0;
-    while (true) {
-      try {
-        return await txFn();
-      } catch (err) {
-        attempt++;
+  let attempt = 0;
+  while (true) {
+    try {
+      // Execute only the active broadcast inside the sequential queue lock
+      return await new Promise((resolve, reject) => {
+        queueTx(async () => {
+          try {
+            const res = await txFn();
+            resolve(res);
+          } catch (err) {
+            reject(err);
+          }
+        });
+      });
+    } catch (err) {
+      attempt++;
 
-        // Extract raw revert data if available
-        const rawData =
-          err?.data ||
-          err?.error?.data ||
-          err?.payload?.data ||
-          err?.info?.error?.data ||
-          err?.receipt?.revertReason;
+      // Extract raw revert data if available
+      const rawData =
+        err?.data ||
+        err?.error?.data ||
+        err?.payload?.data ||
+        err?.info?.error?.data ||
+        err?.receipt?.revertReason;
 
-        const isRevert =
-          err.code === "CALL_EXCEPTION" ||
-          err.message?.includes("execution reverted") ||
-          Boolean(rawData);
+      const isRevert =
+        err.code === "CALL_EXCEPTION" ||
+        err.message?.includes("execution reverted") ||
+        Boolean(rawData);
 
-        // Fail fast on contract execution reverts or max retries
-        if (attempt >= maxRetries || isRevert) {
-          throw err;
-        }
-
-        // RESYNC NONCEMANAGER: Clear cached nonce gaps on RPC network errors
-        if (typeof operatorWallet.reset === "function") {
-          operatorWallet.reset();
-        }
-
-        const delay = initialDelayMs * Math.pow(2, attempt - 1);
-        log(
-          "tx",
-          `Broadcast error (attempt ${attempt}/${maxRetries}): ${
-            err.shortMessage ?? err.message
-          }. Retrying in ${delay}ms...`
-        );
-        await new Promise((resolve) => setTimeout(resolve, delay));
+      // Fail fast on contract execution reverts or max retries
+      if (attempt >= maxRetries || isRevert) {
+        throw err;
       }
+
+      // RESYNC NONCEMANAGER: Clear cached nonce gaps on RPC network errors
+      if (typeof operatorWallet.reset === "function") {
+        operatorWallet.reset();
+      }
+
+      const delay = initialDelayMs * Math.pow(2, attempt - 1);
+      log(
+        "tx",
+        `Broadcast error (attempt ${attempt}/${maxRetries}): ${
+          err.shortMessage ?? err.message
+        }. Retrying in ${delay}ms...`
+      );
+
+      // Delay happens OUTSIDE the queue lock so other copiers are not blocked
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
-  });
+  }
 }
 
 // ── DB setup ────────────────────────────────────────────────────────
@@ -241,10 +251,11 @@ db.exec(`
 
 function upsertUser(wallet) {
   const now = Date.now();
+  const w = wallet.toLowerCase();
   db.prepare(
     `INSERT INTO users (wallet_address, created_at, updated_at) VALUES (?, ?, ?)
-     ON CONFLICT(wallet_address) DO NOTHING`
-  ).run(wallet, now, now);
+     ON CONFLICT(wallet_address) DO UPDATE SET updated_at = excluded.updated_at`
+  ).run(w, now, now);
 }
 
 function recordEvent(wallet, event, detail, txHash) {
@@ -275,14 +286,35 @@ function isValidWebhookSecret(req) {
   return timingSafeEqual(a, b);
 }
 
-function rawPriceQty(price, quantity, dec) {
-  const d = Number(dec);
-  let steppedQty = Math.floor(Number(quantity) / QTY_STEP) * QTY_STEP;
-  if (steppedQty < QTY_STEP && Number(quantity) >= QTY_STEP * 0.5) {
-    steppedQty = QTY_STEP;
-  }
-  const priceRaw = ethers.parseUnits(Number(price).toFixed(d), d);
-  const quantityRaw = ethers.parseUnits(steppedQty.toFixed(d), d);
+// Small, fixed grid steps 
+const PRICE_STEP = Number(process.env.COPY_PRICE_STEP ?? 0.0001); // 4dp price tick
+
+// Snap a human amount to a whole number of `step`-sized grid units, returned
+// as an exact bigint in `dec`-decimal raw units. stepsPerOne stays small
+// (e.g. 10000 for a 4dp tick, 100 for a 0.01 lot), so `human * stepsPerOne`
+// can't drift by a whole grid step the way `toFixed(18)` can.
+function toRawUnits(human, dec, step) {
+  const one = 10n ** BigInt(dec);
+  const stepRaw = (one * BigInt(Math.round(step * 1e8))) / BigInt(1e8);
+  const stepsPerOne = Number(one / stepRaw);
+  const steps = Math.round(human * stepsPerOne);
+  return BigInt(Math.max(0, steps)) * stepRaw;
+}
+
+function rawPriceQty(price, collateralRaw, dec) {
+  const one = 10n ** BigInt(dec);
+  const priceRaw = toRawUnits(price, dec, PRICE_STEP);   // still round — this is just the limit price
+  if (priceRaw <= 0n) return { priceRaw, quantityRaw: 0n, steppedQty: 0 };
+
+  // Exact bigint floor: the most quantity currentColRaw can buy at priceRaw,
+  // guaranteed to satisfy priceRaw * quantityRaw <= collateralRaw.
+  const maxAffordableRaw = (collateralRaw * one) / priceRaw;
+
+  // Now floor THAT to the lot grid — never round up a size.
+  const lotStepRaw = (one * BigInt(Math.round(QTY_STEP * 1e8))) / BigInt(1e8);
+  const quantityRaw = (maxAffordableRaw / lotStepRaw) * lotStepRaw;
+
+  const steppedQty = Number(quantityRaw) / Number(one);
   return { priceRaw, quantityRaw, steppedQty };
 }
 
@@ -290,11 +322,12 @@ function rawPriceQty(price, quantity, dec) {
 async function copyForUser(wallet, signal, dec, collateralRaw) {
   if (!collateralRaw || collateralRaw <= 0n) return;
 
-  const MAX_SIGNAL_AGE_MS = 6 * 60 * 1000; // Hard TTL limit (6 minutes from signal creation)
   const ABSOLUTE_MAX_PRICE = 0.9; // Never fill higher than 0.90 (capped against drift)
 
   const basePrice = Number(signal.price);
-  const signalTimestamp = Number(signal.timestamp ?? Date.now());
+  const signalTimestamp = Number(
+    signal.timestamp ?? signal.createdAt ?? Date.now()
+  );
 
   // 1. Cap maximum aggressive price at 0.90
   const maxPriceCap = Math.min(
@@ -310,16 +343,16 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
     return;
   }
 
+  const expiryMs = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
+  const cutoffTimestamp = expiryMs - CUTOFF_BUFFER_MS;
+  const MAX_ALLOWED_AGE_MS = Number(process.env.MAX_SIGNAL_AGE_MS ?? 120_000);
   // 2. Initial signal freshness check
-  if (Date.now() - signalTimestamp > MAX_SIGNAL_AGE_MS) {
-    log("signal", `${wallet}: skip — signal is stale`);
+  if (Date.now() > cutoffTimestamp || (Date.now() - signalTimestamp) > MAX_ALLOWED_AGE_MS) {
+    log("signal", `${wallet}: skip — signal is stale or past cutoff`);
     return;
   }
 
   // 3. Setup window expiry and cutoff window (defaults to 15m window)
-  const expiryMs = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
-  const cutoffTimestamp = expiryMs - CUTOFF_BUFFER_MS;
-
   const defaultBufferPrice = basePrice + Math.max(0.02, basePrice * 0.25);
   const initialLimitPrice = Number(signal.limitPrice ?? defaultBufferPrice);
   const targetPrice = Math.min(maxPriceCap, initialLimitPrice);
@@ -346,7 +379,7 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
   // 4. Polling loop: Runs until 2 mins before expiry or until TTL breaches
   while (Date.now() < cutoffTimestamp) {
     // Abandon if loop exceeds 2-minute signal TTL
-    if (Date.now() - signalTimestamp > MAX_SIGNAL_AGE_MS) {
+    if (Date.now() - signalTimestamp > MAX_ALLOWED_AGE_MS) {
       log(
         "signal",
         `${wallet}: abandoned retry loop — reached TTL limit for ${signal.symbol}`
@@ -367,11 +400,7 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
 
       const colNum = Number(ethers.formatUnits(currentColRaw, dec));
       const quantity = colNum / attempt.price;
-      const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(
-        attempt.price,
-        quantity,
-        dec
-      );
+      const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(attempt.price, currentColRaw, dec);
 
       if (steppedQty <= 0) continue;
 
@@ -423,7 +452,7 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
           );
         }
       } catch (err) {
-        // If the error has a receipt or transactionHash, it was broadcast and reverted on-chain
+        // If it was actually broadcast and reverted on-chain → stop
         if (err.receipt || err.transactionHash) {
           log(
             "signal",
@@ -431,12 +460,13 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
               err.shortMessage ?? err.message
             }`
           );
-          return; // Stop retrying for this user on actual on-chain revert
+          return;
         }
 
-        // Otherwise, staticCall probe rejected off-chain (no liquidity at this tier)
-        // Move to the next fallback size tier or wait for the next 3s poll tick
-        continue;
+        // Off-chain probe failed
+        const reason = parseRevertReason(err, vault.interface);
+        log("signal", `${wallet}: probe failed (${attempt.label}) → ${reason}`);
+        continue; // try next size tier
       }
 
       // Step C: RECORD IN DB — On-chain transaction succeeded
@@ -639,7 +669,10 @@ async function handleSettlement(settlement) {
     settlement.symbol;
 
   if (!targetMarket) {
-    log("settlement", "Settlement failed: missing market identifier in payload.");
+    log(
+      "settlement",
+      "Settlement failed: missing market identifier in payload."
+    );
     return;
   }
 
@@ -720,7 +753,10 @@ async function handleSettlement(settlement) {
           `redeemMarket attempt ${attempt}/${maxRedeemAttempts} failed: ${parsedErr}`
         );
         if (attempt < maxRedeemAttempts) {
-          log("settlement", `Waiting 3s for oracle/market state before retrying redeemMarket...`);
+          log(
+            "settlement",
+            `Waiting 3s for oracle/market state before retrying redeemMarket...`
+          );
           await new Promise((r) => setTimeout(r, 3000));
         }
       }
@@ -784,10 +820,7 @@ async function handleSettlement(settlement) {
       );
     } catch (e) {
       const parsedErr = parseRevertReason(e, vault.interface);
-      log(
-        "settlement",
-        `position ${trade.position_id} failed: ${parsedErr}`
-      );
+      log("settlement", `position ${trade.position_id} failed: ${parsedErr}`);
     }
   }
 }
@@ -836,7 +869,7 @@ const routes = {
     return json(res, 202, { accepted: true });
   },
 
-"POST /api/settlement": async (req, res) => {
+  "POST /api/settlement": async (req, res) => {
     if (!isValidWebhookSecret(req)) {
       log(
         "settlement",
@@ -845,7 +878,7 @@ const routes = {
       return json(res, 401, { error: "unauthorized" });
     }
     const settlement = await readBody(req);
-    
+
     // Check for any valid market identifier key
     const targetMarket =
       settlement.marketId ||
@@ -859,7 +892,7 @@ const routes = {
     ) {
       return json(res, 400, { error: "invalid settlement payload" });
     }
-    
+
     handleSettlement(settlement).catch((e) =>
       log("settlement", `handleSettlement error: ${e.message}`)
     );
@@ -921,10 +954,21 @@ const routes = {
       )
       .all();
 
-    const { count } = db.prepare(`SELECT COUNT(*) as count FROM users`).get();
+    // Only count wallets that actually have copy enabled + positive trade size on-chain
+    const allWallets = knownWallets();
+    let active = 0;
+    const dec = await decimals();
+    await Promise.all(
+      allWallets.map(async (w) => {
+        try {
+          const [balance, , copyEnabled, tradeSize] = await vault.getAccount(w);
+          if (copyEnabled && tradeSize > 0n && balance > 0n) active++;
+        } catch {}
+      })
+    );
 
     return json(res, 200, {
-      activeCopiers: count ?? 0,
+      activeCopiers: active,
       leaderboard: rows.map((r) => ({
         wallet: r.wallet_address,
         pnl: r.pnl ?? 0,
@@ -969,15 +1013,20 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, () => {
   log("server", `listening on port ${PORT}`);
   log("server", `vault: ${VAULT_ADDRESS}, operator: ${rawWallet.address}`);
-  
+
   // Background interval to report stuck OPEN trades
   setInterval(() => {
     try {
       const stuck = db
-        .prepare(`SELECT position_id, symbol, market_id FROM copy_trades WHERE status = 'OPEN'`)
+        .prepare(
+          `SELECT position_id, symbol, market_id FROM copy_trades WHERE status = 'OPEN'`
+        )
         .all();
       if (stuck.length > 0) {
-        log("cron", `Notice: ${stuck.length} unsettled OPEN trade(s) currently in DB.`);
+        log(
+          "cron",
+          `Notice: ${stuck.length} unsettled OPEN trade(s) currently in DB.`
+        );
       }
     } catch (e) {
       log("cron", `Background check error: ${e.message}`);
