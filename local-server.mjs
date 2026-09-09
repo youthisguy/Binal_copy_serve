@@ -286,7 +286,7 @@ function isValidWebhookSecret(req) {
   return timingSafeEqual(a, b);
 }
 
-// Small, fixed grid steps 
+// Small, fixed grid steps
 const PRICE_STEP = Number(process.env.COPY_PRICE_STEP ?? 0.0001); // 4dp price tick
 
 // Snap a human amount to a whole number of `step`-sized grid units, returned
@@ -303,7 +303,7 @@ function toRawUnits(human, dec, step) {
 
 function rawPriceQty(price, collateralRaw, dec) {
   const one = 10n ** BigInt(dec);
-  const priceRaw = toRawUnits(price, dec, PRICE_STEP);   // still round — this is just the limit price
+  const priceRaw = toRawUnits(price, dec, PRICE_STEP); // still round — this is just the limit price
   if (priceRaw <= 0n) return { priceRaw, quantityRaw: 0n, steppedQty: 0 };
 
   // Exact bigint floor: the most quantity currentColRaw can buy at priceRaw,
@@ -321,7 +321,17 @@ function rawPriceQty(price, collateralRaw, dec) {
 // ── Signal handling ─────────────────────────────────────────────────
 async function copyForUser(wallet, signal, dec, collateralRaw) {
   if (!collateralRaw || collateralRaw <= 0n) return;
-
+  if (
+    !signal.outcomeToken ||
+    signal.outcomeToken === ethers.ZeroAddress ||
+    signal.yesId == null ||
+    signal.noId == null ||
+    signal.yesId === "" ||
+    signal.noId === ""
+  ) {
+    log("signal", `${wallet}: skip — missing outcomeToken/yesId/noId`);
+    return;
+  }
   const ABSOLUTE_MAX_PRICE = 0.9; // Never fill higher than 0.90 (capped against drift)
 
   const basePrice = Number(signal.price);
@@ -347,7 +357,10 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
   const cutoffTimestamp = expiryMs - CUTOFF_BUFFER_MS;
   const MAX_ALLOWED_AGE_MS = Number(process.env.MAX_SIGNAL_AGE_MS ?? 120_000);
   // 2. Initial signal freshness check
-  if (Date.now() > cutoffTimestamp || (Date.now() - signalTimestamp) > MAX_ALLOWED_AGE_MS) {
+  if (
+    Date.now() > cutoffTimestamp ||
+    Date.now() - signalTimestamp > MAX_ALLOWED_AGE_MS
+  ) {
     log("signal", `${wallet}: skip — signal is stale or past cutoff`);
     return;
   }
@@ -400,7 +413,11 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
 
       const colNum = Number(ethers.formatUnits(currentColRaw, dec));
       const quantity = colNum / attempt.price;
-      const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(attempt.price, currentColRaw, dec);
+      const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(
+        attempt.price,
+        currentColRaw,
+        dec
+      );
 
       if (steppedQty <= 0) continue;
 
@@ -411,9 +428,9 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
         side: sideCode,
         collateral: currentColRaw,
         pool: signal.pool,
-        outcomeToken: ethers.ZeroAddress,
-        yesId: 0,
-        noId: 0,
+        outcomeToken: signal.outcomeToken,
+        yesId: BigInt(signal.yesId),
+        noId: BigInt(signal.noId),
         priceRaw,
         quantityRaw,
         expireTimestampNs: BigInt(Math.floor(expiryMs / 1000)) * 1_000_000_000n,
@@ -721,13 +738,20 @@ async function handleSettlement(settlement) {
   }
 
   // 3. Retry redeemMarket with delay if Oracle is lagging
+  let sideCode = null; // ← declare here, outside the block
   if (settlement.outcome === "WIN" || settlement.payoutPerShare > 0) {
-    const sideCode =
+    if (
+      settlement.winningSide === undefined ||
+      settlement.winningSide === null
+    ) {
+      log(
+        "settlement",
+        `refusing to settle ${targetMarket}: winningSide not provided`
+      );
+      return;
+    }
+    sideCode =
       settlement.winningSide === "BUY_NO" || settlement.winningSide === 1
-        ? 1
-        : settlement.winningSide === "BUY_YES" || settlement.winningSide === 0
-        ? 0
-        : open[0].side === "BUY_NO"
         ? 1
         : 0;
 
@@ -761,12 +785,45 @@ async function handleSettlement(settlement) {
         }
       }
     }
+
+    if (!redeemed) {
+      log(
+        "settlement",
+        `redeemMarket never succeeded for ${targetMarket} — aborting settle, will retry on next webhook`
+      );
+      return;
+    }
   }
 
+  const winningSideStr =
+    sideCode === 1 ? "BUY_NO" : sideCode === 0 ? "BUY_YES" : null;
   // 4. Settle each user's trade
   for (const trade of open) {
     try {
-      const payout = trade.shares * settlement.payoutPerShare;
+      const onchainPos = await vault.getPosition(trade.position_id);
+      const onchainShares = Number(ethers.formatUnits(onchainPos.shares, dec));
+      if (onchainPos.settled) {
+        log(
+          "settlement",
+          `position ${trade.position_id}: already settled on-chain, syncing DB`
+        );
+        db.prepare(
+          `UPDATE copy_trades SET status='SETTLED' WHERE position_id=?`
+        ).run(trade.position_id);
+        continue;
+      }
+      if (Math.abs(onchainShares - trade.shares) > 1e-6) {
+        log(
+          "settlement",
+          `position ${trade.position_id}: DB shares (${trade.shares}) != on-chain shares (${onchainShares}) — skipping, needs manual review`
+        );
+        continue;
+      }
+
+      const payout =
+        winningSideStr && trade.side === winningSideStr
+          ? trade.shares * settlement.payoutPerShare
+          : 0;
       const payoutRaw = ethers.parseUnits(
         Math.max(payout, 0).toFixed(dec),
         dec
