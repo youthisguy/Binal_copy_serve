@@ -42,8 +42,8 @@ interface IBinaryMarket {
     function collateral() external view returns (address);
 }
 
-interface ICollateralRouter {
-    function redeemNative(
+interface IBinaryModule {
+    function redeem(
         uint32 operatorId,
         bytes32 venueId,
         bytes32 marketId,
@@ -70,7 +70,7 @@ contract CopyVault is Ownable, ReentrancyGuard {
     address public operator;
 
     // DreamDEX venue identifiers
-    address public immutable collateralRouter;
+    address public immutable binaryModule;
     bytes32 public immutable venueId;
     uint32 public immutable operatorId;
 
@@ -174,7 +174,7 @@ contract CopyVault is Ownable, ReentrancyGuard {
         address _operator,
         address _feeRecipient,
         uint256 _feeBps,
-        address _collateralRouter,
+        address _binaryModule,
         bytes32 _venueId,
         uint32 _operatorId
     ) Ownable(msg.sender) {
@@ -186,8 +186,8 @@ contract CopyVault is Ownable, ReentrancyGuard {
         require(_feeRecipient != address(0), "CopyVault: zero fee recipient");
         require(_feeBps <= MAX_FEE_BPS, "CopyVault: fee exceeds cap");
         require(
-            _collateralRouter != address(0),
-            "CopyVault: zero collateral router"
+            _binaryModule != address(0),
+            "CopyVault: zero binary module"
         );
 
         collateralToken = IERC20(_collateralToken);
@@ -195,7 +195,7 @@ contract CopyVault is Ownable, ReentrancyGuard {
         operator = _operator;
         feeRecipient = _feeRecipient;
         feeBps = _feeBps;
-        collateralRouter = _collateralRouter;
+        binaryModule = _binaryModule;
         venueId = _venueId;
         operatorId = _operatorId;
     }
@@ -336,22 +336,22 @@ contract CopyVault is Ownable, ReentrancyGuard {
         MarketTokenInfo memory info = marketTokenInfo[marketId];
         require(info.set, "CopyVault: unknown market token info");
 
-        // ensure the router can pull the outcome token from the vault
+        // ensure the module can pull the outcome token from the vault
         if (
             !IOutcomeToken(info.outcomeToken).isOperator(
                 address(this),
-                collateralRouter
+                binaryModule
             )
         ) {
             IOutcomeToken(info.outcomeToken).setOperator(
-                collateralRouter,
+                binaryModule,
                 true
             );
         }
 
         uint256 beforeBal = collateralToken.balanceOf(address(this));
 
-        ICollateralRouter(collateralRouter).redeemNative(
+        IBinaryModule(binaryModule).redeem(
             operatorId,
             venueId,
             marketId,
