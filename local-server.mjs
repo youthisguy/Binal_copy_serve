@@ -772,6 +772,19 @@ async function handleSettlement(settlement) {
         break;
       } catch (e) {
         const parsedErr = parseRevertReason(e, vault.interface);
+
+        // Market was already redeemed by an earlier webhook delivery — this
+        // means the on-chain state we need is already in place, so treat it
+        // as success and proceed to settle positions instead of aborting.
+        if (/already redeemed/i.test(parsedErr) || /AlreadyRedeemed/.test(parsedErr)) {
+          log(
+            "settlement",
+            `redeemMarket: ${targetMarket} already redeemed on-chain — proceeding to settle positions`
+          );
+          redeemed = true;
+          break;
+        }
+
         log(
           "settlement",
           `redeemMarket attempt ${attempt}/${maxRedeemAttempts} failed: ${parsedErr}`
