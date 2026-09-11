@@ -25,6 +25,8 @@ const QTY_STEP = Number(process.env.COPY_QTY_STEP ?? 0.01);
 const WEBHOOK_SECRET = process.env.COPY_WEBHOOK_SECRET;
 const POLL_INTERVAL_MS = 3_000; // Check order book every 3 seconds
 const CUTOFF_BUFFER_MS = 1 * 60 * 1000; // Stop 1 minutes before expiry
+const RPC_READ_TIMEOUT_MS = Number(process.env.COPY_RPC_READ_TIMEOUT_MS ?? 15_000);
+const RPC_TX_TIMEOUT_MS = Number(process.env.COPY_RPC_TX_TIMEOUT_MS ?? 60_000);
 
 if (!RPC_URL || !VAULT_ADDRESS || !OPERATOR_KEY) {
   console.error(
@@ -145,6 +147,18 @@ async function decimals() {
 const log = (scope, s) =>
   console.log(`${new Date().toISOString()} [${scope}] ${s}`);
 
+// Wraps a promise so a hung RPC call throws instead of stalling forever.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Timed out after ${ms}ms: ${label}`)),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // ── Transaction Queue & Retry Setup ─────────────────────────────────
 let txQueue = Promise.resolve();
 
@@ -184,6 +198,17 @@ async function executeTxWithRetry(txFn, maxRetries = 3, initialDelayMs = 200) {
         err.code === "CALL_EXCEPTION" ||
         err.message?.includes("execution reverted") ||
         Boolean(rawData);
+
+      // A tx that was broadcast but whose wait() timed out must NEVER be
+      // silently retried — the original tx may still confirm later, and
+      // resubmitting risks a double-send. Fail fast for manual review.
+      if (err.isPostBroadcastTimeout) {
+        log(
+          "tx",
+          `Broadcast tx ${err.txHash ?? "unknown"} timed out waiting for confirmation — NOT retrying, verify on-chain manually.`
+        );
+        throw err;
+      }
 
       // Fail fast on contract execution reverts or max retries
       if (attempt >= maxRetries || isRevert) {
@@ -442,12 +467,30 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
 
       try {
         const result = await executeTxWithRetry(async () => {
-          // 1. Off-chain probe inside serial queue
-          await vault.openPositionFor.staticCall(openParams);
+          // 1. Off-chain probe inside serial queue — nothing broadcast yet,
+          // safe to time out and retry.
+          await withTimeout(
+            vault.openPositionFor.staticCall(openParams),
+            RPC_READ_TIMEOUT_MS,
+            "openPositionFor.staticCall()"
+          );
           // 2. Broadcast transaction
           const tx = await vault.openPositionFor(openParams);
-          // 3. Wait for block inclusion INSIDE queue so chain state updates for next user
-          const rx = await tx.wait();
+          // 3. Wait for block inclusion INSIDE queue so chain state updates for
+          // next user. If confirmation times out, the tx may still land later —
+          // tag the error so it's never auto-retried.
+          let rx;
+          try {
+            rx = await withTimeout(
+              tx.wait(),
+              RPC_TX_TIMEOUT_MS,
+              `openPositionFor tx.wait() (${tx.hash})`
+            );
+          } catch (waitErr) {
+            waitErr.isPostBroadcastTimeout = true;
+            waitErr.txHash = tx.hash;
+            throw waitErr;
+          }
           return { tx, rx };
         });
 
@@ -469,6 +512,17 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
           );
         }
       } catch (err) {
+        // Tx was broadcast but confirmation timed out — it may still land
+        // on-chain. Do NOT try another size tier, that risks a double-open.
+        // Stop and require manual verification.
+        if (err.isPostBroadcastTimeout) {
+          log(
+            "signal",
+            `${wallet}: CRITICAL — tx ${err.txHash} broadcast but confirmation timed out. Verify on-chain manually before any retry.`
+          );
+          return;
+        }
+
         // If it was actually broadcast and reverted on-chain → stop
         if (err.receipt || err.transactionHash) {
           log(
@@ -717,9 +771,13 @@ async function handleSettlement(settlement) {
     `Found ${open.length} open position(s) to settle for "${targetMarket}".`
   );
 
-  const dec = await decimals();
+  const dec = await withTimeout(decimals(), RPC_READ_TIMEOUT_MS, "decimals()");
 
-  const tokenAddr = await vault.collateralToken();
+  const tokenAddr = await withTimeout(
+    vault.collateralToken(),
+    RPC_READ_TIMEOUT_MS,
+    "vault.collateralToken()"
+  );
   const token = new ethers.Contract(
     tokenAddr,
     [
@@ -728,12 +786,20 @@ async function handleSettlement(settlement) {
     ],
     operatorWallet
   );
-  const allowance = await token.allowance(rawWallet.address, VAULT_ADDRESS);
+  const allowance = await withTimeout(
+    token.allowance(rawWallet.address, VAULT_ADDRESS),
+    RPC_READ_TIMEOUT_MS,
+    "token.allowance()"
+  );
   if (allowance < ethers.MaxUint256 / 2n) {
     const approveTx = await executeTxWithRetry(() =>
       token.approve(VAULT_ADDRESS, ethers.MaxUint256)
     );
-    await approveTx.wait();
+    await withTimeout(
+      approveTx.wait(),
+      RPC_TX_TIMEOUT_MS,
+      `approveTx.wait() (${approveTx.hash})`
+    );
     log("settlement", `approved vault MaxUint256 for collateral pulls`);
   }
 
@@ -763,7 +829,11 @@ async function handleSettlement(settlement) {
         const redeemTx = await executeTxWithRetry(() =>
           vault.redeemMarket(open[0].market_id, sideCode)
         );
-        const redeemReceipt = await redeemTx.wait();
+        const redeemReceipt = await withTimeout(
+          redeemTx.wait(),
+          RPC_TX_TIMEOUT_MS,
+          `redeemTx.wait() (${redeemTx.hash})`
+        );
         log(
           "settlement",
           `redeemMarket ${open[0].market_id} side=${sideCode} tx=${redeemReceipt.hash}`
@@ -813,7 +883,11 @@ async function handleSettlement(settlement) {
   // 4. Settle each user's trade
   for (const trade of open) {
     try {
-      const onchainPos = await vault.getPosition(trade.position_id);
+      const onchainPos = await withTimeout(
+        vault.getPosition(trade.position_id),
+        RPC_READ_TIMEOUT_MS,
+        `vault.getPosition(${trade.position_id})`
+      );
       const onchainShares = Number(ethers.formatUnits(onchainPos.shares, dec));
       if (onchainPos.settled) {
         log(
@@ -845,7 +919,11 @@ async function handleSettlement(settlement) {
       const tx = await executeTxWithRetry(() =>
         vault.settlePosition(trade.position_id, payoutRaw)
       );
-      const receipt = await tx.wait();
+      const receipt = await withTimeout(
+        tx.wait(),
+        RPC_TX_TIMEOUT_MS,
+        `settlePosition tx.wait() (${tx.hash})`
+      );
       const settled = receipt.logs
         .map((l) => {
           try {
