@@ -26,7 +26,7 @@ const WEBHOOK_SECRET = process.env.COPY_WEBHOOK_SECRET;
 const POLL_INTERVAL_MS = 3_000; // Check order book every 3 seconds
 const CUTOFF_BUFFER_MS = 1 * 60 * 1000; // Stop 1 minutes before expiry
 const RPC_READ_TIMEOUT_MS = Number(process.env.COPY_RPC_READ_TIMEOUT_MS ?? 15_000);
-const RPC_TX_TIMEOUT_MS = Number(process.env.COPY_RPC_TX_TIMEOUT_MS ?? 60_000);
+const RPC_TX_TIMEOUT_MS = Number(process.env.COPY_RPC_TX_TIMEOUT_MS ?? 150_000);
 
 if (!RPC_URL || !VAULT_ADDRESS || !OPERATOR_KEY) {
   console.error(
