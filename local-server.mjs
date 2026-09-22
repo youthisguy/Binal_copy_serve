@@ -380,70 +380,48 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
 
   const expiryMs = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
   const cutoffTimestamp = expiryMs - CUTOFF_BUFFER_MS;
-  const MAX_ALLOWED_AGE_MS = Number(process.env.MAX_SIGNAL_AGE_MS ?? 120_000);
-  // 2. Initial signal freshness check
-  if (
-    Date.now() > cutoffTimestamp ||
-    Date.now() - signalTimestamp > MAX_ALLOWED_AGE_MS
-  ) {
-    log("signal", `${wallet}: skip — signal is stale or past cutoff`);
-    return;
-  }
+
+ // 2. Initial freshness check 
+if (Date.now() > cutoffTimestamp) {
+  log("signal", `${wallet}: skip — past cutoff`);
+  return;
+}
 
   // 3. Setup window expiry and cutoff window (defaults to 15m window)
   const defaultBufferPrice = basePrice + Math.max(0.02, basePrice * 0.25);
   const initialLimitPrice = Number(signal.limitPrice ?? defaultBufferPrice);
   const targetPrice = Math.min(maxPriceCap, initialLimitPrice);
 
-  // 3-Step Sizing Ladder (prices guaranteed <= 0.90)
-  const attempts = [
-    {
-      price: targetPrice,
-      scale: 1.0,
-      label: `100% @ ${targetPrice.toFixed(4)}`,
-    },
-    {
-      price: maxPriceCap,
-      scale: 0.75,
-      label: `75% @ ${maxPriceCap.toFixed(2)}`,
-    },
-    {
-      price: maxPriceCap,
-      scale: 0.5,
-      label: `50% @ ${maxPriceCap.toFixed(2)}`,
-    },
-  ];
-
-  // 4. Polling loop: Runs until 2 mins before expiry or until TTL breaches
+  // Poll until real market cutoff — no artificial TTL abandon anymore
   while (Date.now() < cutoffTimestamp) {
-    // Abandon if loop exceeds 2-minute signal TTL
-    if (Date.now() - signalTimestamp > MAX_ALLOWED_AGE_MS) {
-      log(
-        "signal",
-        `${wallet}: abandoned retry loop — reached TTL limit for ${signal.symbol}`
-      );
-      return;
-    }
+    const timeLeftMs = cutoffTimestamp - Date.now();
+    const totalWindowMs = cutoffTimestamp - signalTimestamp;
+    const urgency = 1 - Math.max(0, Math.min(1, timeLeftMs / totalWindowMs));
+
+    const escalatedPrice = Math.min(
+      ABSOLUTE_MAX_PRICE,
+      targetPrice + (ABSOLUTE_MAX_PRICE - targetPrice) * urgency
+    );
+
+    const attempts = [
+      { price: escalatedPrice, scale: 1.0, label: `100% @ ${escalatedPrice.toFixed(4)}` },
+      { price: maxPriceCap, scale: 0.75, label: `75% @ ${maxPriceCap.toFixed(2)}` },
+      { price: maxPriceCap, scale: 0.5, label: `50% @ ${maxPriceCap.toFixed(2)}` },
+    ];
 
     for (let i = 0; i < attempts.length; i++) {
       const attempt = attempts[i];
-
-      // Double guard: Skip tier if calculated target exceeds 0.90
       if (attempt.price > ABSOLUTE_MAX_PRICE) continue;
 
       const currentColRaw =
         (collateralRaw * BigInt(Math.round(attempt.scale * 100))) / 100n;
-
       if (currentColRaw <= 0n) break;
 
-      const colNum = Number(ethers.formatUnits(currentColRaw, dec));
-      const quantity = colNum / attempt.price;
       const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(
         attempt.price,
         currentColRaw,
         dec
       );
-
       if (steppedQty <= 0) continue;
 
       const sideCode = signal.side === "BUY_YES" ? 0 : 1;
@@ -461,24 +439,15 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
         expireTimestampNs: BigInt(Math.floor(expiryMs / 1000)) * 1_000_000_000n,
       };
 
-      // Step A & B: SIMULATE IN QUEUE, BROADCAST, AND WAIT FOR MINED BLOCK
-      let receipt;
-      let opened;
-
+      let receipt, opened;
       try {
         const result = await executeTxWithRetry(async () => {
-          // 1. Off-chain probe inside serial queue — nothing broadcast yet,
-          // safe to time out and retry.
           await withTimeout(
             vault.openPositionFor.staticCall(openParams),
             RPC_READ_TIMEOUT_MS,
             "openPositionFor.staticCall()"
           );
-          // 2. Broadcast transaction
           const tx = await vault.openPositionFor(openParams);
-          // 3. Wait for block inclusion INSIDE queue so chain state updates for
-          // next user. If confirmation times out, the tx may still land later —
-          // tag the error so it's never auto-retried.
           let rx;
           try {
             rx = await withTimeout(
@@ -495,121 +464,64 @@ async function copyForUser(wallet, signal, dec, collateralRaw) {
         });
 
         receipt = result.rx;
-
         opened = receipt.logs
           .map((l) => {
-            try {
-              return vault.interface.parseLog(l);
-            } catch {
-              return null;
-            }
+            try { return vault.interface.parseLog(l); } catch { return null; }
           })
           .find((e) => e?.name === "PositionOpened");
 
         if (!opened) {
-          throw new Error(
-            `tx ${receipt.hash} confirmed but missing PositionOpened event`
-          );
+          throw new Error(`tx ${receipt.hash} confirmed but missing PositionOpened event`);
         }
       } catch (err) {
-        // Tx was broadcast but confirmation timed out — it may still land
-        // on-chain. Do NOT try another size tier, that risks a double-open.
-        // Stop and require manual verification.
         if (err.isPostBroadcastTimeout) {
-          log(
-            "signal",
-            `${wallet}: CRITICAL — tx ${err.txHash} broadcast but confirmation timed out. Verify on-chain manually before any retry.`
-          );
+          log("signal", `${wallet}: CRITICAL — tx ${err.txHash} broadcast but confirmation timed out. Verify on-chain manually before any retry.`);
           return;
         }
-
-        // If it was actually broadcast and reverted on-chain → stop
         if (err.receipt || err.transactionHash) {
-          log(
-            "signal",
-            `${wallet}: tx execution failed on-chain: ${
-              err.shortMessage ?? err.message
-            }`
-          );
+          log("signal", `${wallet}: tx execution failed on-chain: ${err.shortMessage ?? err.message}`);
           return;
         }
-
-        // Off-chain probe failed
         const reason = parseRevertReason(err, vault.interface);
         log("signal", `${wallet}: probe failed (${attempt.label}) → ${reason}`);
-        continue; // try next size tier
+        continue;
       }
-
-      // Step C: RECORD IN DB — On-chain transaction succeeded
 
       try {
         const positionId = Number(opened.args.positionId);
-        const usedCollateral = Number(
-          ethers.formatUnits(opened.args.collateral, dec)
-        );
+        const usedCollateral = Number(ethers.formatUnits(opened.args.collateral, dec));
         const shares = Number(ethers.formatUnits(opened.args.shares, dec));
         const entryPrice = shares > 0 ? usedCollateral / shares : basePrice;
 
-        db.prepare(
-          `
+        db.prepare(`
           INSERT INTO copy_trades (
             position_id, wallet_address, market_id, symbol, asset, window, side,
             shares, collateral_at_entry, entry_price, tx_hash, status,
             source_signal_id, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
-        `
-        ).run(
-          positionId,
-          wallet,
-          signal.marketId,
-          signal.symbol ?? "",
-          signal.asset ?? "",
-          signal.window ?? "",
-          signal.side,
-          shares,
-          usedCollateral,
-          entryPrice,
-          receipt.hash,
-          signal.signalId ?? null,
-          Date.now()
+        `).run(
+          positionId, wallet, signal.marketId, signal.symbol ?? "", signal.asset ?? "",
+          signal.window ?? "", signal.side, shares, usedCollateral, entryPrice,
+          receipt.hash, signal.signalId ?? null, Date.now()
         );
 
-        recordEvent(
-          wallet,
-          "position_opened",
-          {
-            positionId,
-            marketId: signal.marketId,
-            collateral: usedCollateral,
-            shares,
-          },
+        recordEvent(wallet, "position_opened",
+          { positionId, marketId: signal.marketId, collateral: usedCollateral, shares },
           receipt.hash
         );
 
-        log(
-          "signal",
-          `opened position ${positionId} for ${wallet}: ${usedCollateral.toFixed(
-            2
-          )} collateral (${attempt.label}) on ${signal.symbol}`
-        );
+        log("signal", `opened position ${positionId} for ${wallet}: ${usedCollateral.toFixed(2)} collateral (${attempt.label}) on ${signal.symbol}`);
       } catch (dbErr) {
-        log(
-          "signal",
-          `CRITICAL: Position opened on-chain (tx: ${receipt.hash}) but DB write failed: ${dbErr.message}`
-        );
+        log("signal", `CRITICAL: Position opened on-chain (tx: ${receipt.hash}) but DB write failed: ${dbErr.message}`);
       }
 
-      return; // Fill completed — terminate loop
+      return; // filled — done
     }
 
-    // Wait 3s before probing order book liquidity again
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 
-  log(
-    "signal",
-    `${wallet}: retry window closed for ${signal.symbol} (reached 3m expiry cutoff)`
-  );
+  log("signal", `${wallet}: retry window closed for ${signal.symbol} (reached expiry cutoff)`);
 }
 
 async function handleSignal(signal) {
