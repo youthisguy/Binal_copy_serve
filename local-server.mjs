@@ -314,10 +314,12 @@ function isValidWebhookSecret(req) {
 // Small, fixed grid steps
 const PRICE_STEP = Number(process.env.COPY_PRICE_STEP ?? 0.0001); // 4dp price tick
 
-// Snap a human amount to a whole number of `step`-sized grid units, returned
-// as an exact bigint in `dec`-decimal raw units. stepsPerOne stays small
-// (e.g. 10000 for a 4dp tick, 100 for a 0.01 lot), so `human * stepsPerOne`
-// can't drift by a whole grid step the way `toFixed(18)` can.
+// Cushion added on top of the deepest price level a user's fill actually
+// needed, mirroring the `+0.002` cushion index.ts uses on its own IOCs —
+// gives the tx a little room against the book moving between our snapshot
+// and the broadcast landing.
+const PRICE_BUFFER = Number(process.env.COPY_PRICE_BUFFER ?? 0.002);
+
 function toRawUnits(human, dec, step) {
   const one = 10n ** BigInt(dec);
   const stepRaw = (one * BigInt(Math.round(step * 1e8))) / BigInt(1e8);
@@ -326,202 +328,357 @@ function toRawUnits(human, dec, step) {
   return BigInt(Math.max(0, steps)) * stepRaw;
 }
 
-function rawPriceQty(price, collateralRaw, dec) {
-  const one = 10n ** BigInt(dec);
-  const priceRaw = toRawUnits(price, dec, PRICE_STEP); // still round — this is just the limit price
-  if (priceRaw <= 0n) return { priceRaw, quantityRaw: 0n, steppedQty: 0 };
-
-  // Exact bigint floor: the most quantity currentColRaw can buy at priceRaw,
-  // guaranteed to satisfy priceRaw * quantityRaw <= collateralRaw.
-  const maxAffordableRaw = (collateralRaw * one) / priceRaw;
-
-  // Now floor THAT to the lot grid — never round up a size.
-  const lotStepRaw = (one * BigInt(Math.round(QTY_STEP * 1e8))) / BigInt(1e8);
-  const quantityRaw = (maxAffordableRaw / lotStepRaw) * lotStepRaw;
-
-  const steppedQty = Number(quantityRaw) / Number(one);
-  return { priceRaw, quantityRaw, steppedQty };
+function stepQuantityRaw(sharesHuman, dec) {
+  const stepped = Math.floor(Math.max(0, sharesHuman) / QTY_STEP) * QTY_STEP;
+  if (stepped <= 0) return 0n;
+  return ethers.parseUnits(stepped.toFixed(Math.min(dec, 8)), dec);
 }
 
-// ── Signal handling ─────────────────────────────────────────────────
-async function copyForUser(wallet, signal, dec, collateralRaw) {
-  if (!collateralRaw || collateralRaw <= 0n) return;
-  if (
-    !signal.outcomeToken ||
-    signal.outcomeToken === ethers.ZeroAddress ||
-    signal.yesId == null ||
-    signal.noId == null ||
-    signal.yesId === "" ||
-    signal.noId === ""
-  ) {
-    log("signal", `${wallet}: skip — missing outcomeToken/yesId/noId`);
-    return;
+// ── Order-book depth from the main bot ──────────────────────────────
+// the bot's own live book snapshot walks price levels against REAL
+// depth, then polls for new depth for anyone still short.
+// BOT_ORDERBOOK_URL is the bot's own base URL, e.g.
+// https://dreamdex-binal-bot-5by9.onrender.com — same host that serves the
+// dashboard at /index.html. No secret needed: this route is public read-only
+// market depth, same as /volume-pulse.json and /decisions.jsonl.
+const BOT_ORDERBOOK_URL = process.env.BOT_ORDERBOOK_URL;
+const ORDERBOOK_FETCH_TIMEOUT_MS = Number(
+  process.env.COPY_ORDERBOOK_TIMEOUT_MS ?? 5_000
+);
+// The bot writes this roughly once per its own main-loop cycle (OF_INTERVAL_MS,
+// default 8s). Older than this and we treat it as "no data" rather than
+// sizing against a book that's actually gone stale.
+const ORDERBOOK_MAX_AGE_MS = Number(
+  process.env.COPY_ORDERBOOK_MAX_AGE_MS ?? 90_000
+);
+const ABSOLUTE_MAX_PRICE = 0.9; // never fill higher than 0.90, capped against drift
+
+/**
+ * Pull live ask-side depth for one outcome leg from the bot's combined
+ * orderbook-snapshot.json (written every cycle by orderbook-cache.ts, served
+ * by prod-server.mjs/server.mjs). Returns null (never throws) on any
+ * failure — callers must treat "no book" as "wait for the next poll," never
+ * as "assume it's empty" or "assume it's infinite."
+ */
+async function fetchAskDepth(venueSymbol) {
+  if (!BOT_ORDERBOOK_URL) return null;
+  try {
+    const url = `${BOT_ORDERBOOK_URL}/orderbook-snapshot.json`;
+    const res = await withTimeout(
+      fetch(url),
+      ORDERBOOK_FETCH_TIMEOUT_MS,
+      "fetchAskDepth"
+    );
+    if (!res.ok) {
+      log("orderbook", `bot returned HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const entry = data?.books?.[venueSymbol];
+    if (!entry) return null; // bot hasn't scanned/traded this symbol recently
+
+    const age = Date.now() - entry.updatedAt;
+    if (age > ORDERBOOK_MAX_AGE_MS) {
+      log(
+        "orderbook",
+        `snapshot for ${venueSymbol} is stale (${Math.round(age / 1000)}s old) — treating as no data`
+      );
+      return null;
+    }
+    return Array.isArray(entry.asks) ? entry.asks : null; // [[price, amount], ...] ascending
+  } catch (e) {
+    log("orderbook", `fetch failed: ${e.message}`);
+    return null;
   }
-  const ABSOLUTE_MAX_PRICE = 0.9; // Never fill higher than 0.90 (capped against drift)
+}
 
-  const basePrice = Number(signal.price);
-  const signalTimestamp = Number(
-    signal.timestamp ?? signal.createdAt ?? Date.now()
-  );
+/**
+ * Greedily allocate available ask depth across users in priority order
+ * (callers pass smallest-remaining-first, so a big account's fill doesn't
+ * eat depth that would otherwise have covered several small ones). Each
+ * user walks up price levels only as far as THEIR OWN remaining collateral
+ * needs — whoever's first in line doesn't pay the whole book's worst
+ * price, only what their own chunk required. Mutates `levels` in place
+ * (consuming `.amount` as it's allocated) so later calls in the same tick,
+ * or the next poll tick, see what's actually left.
+ *
+ * Returns fills to submit; reduces each user's `remainingCollateralRaw` by
+ * whatever got allocated. Whatever's left stays queued for the next tick.
+ */
+function planFillsAgainstBook(users, levels, maxPrice, dec) {
+  const plan = [];
+  for (const user of users) {
+    if (user.remainingCollateralRaw <= 0n) continue;
 
-  // 1. Cap maximum aggressive price at 0.90
+    let collateralLeft = Number(
+      ethers.formatUnits(user.remainingCollateralRaw, dec)
+    );
+    let sharesGot = 0;
+    let worstPrice = 0;
+
+    for (const lvl of levels) {
+      if (collateralLeft <= 0) break;
+      if (lvl.price > maxPrice || lvl.amount <= 0) continue;
+      const affordable = collateralLeft / lvl.price;
+      const take = Math.min(affordable, lvl.amount);
+      if (take <= 0) continue;
+      sharesGot += take;
+      collateralLeft -= take * lvl.price;
+      worstPrice = Math.max(worstPrice, lvl.price);
+      lvl.amount -= take; // consume — next user in this tick sees less
+    }
+
+    if (sharesGot <= 0) continue;
+
+    const bufferedPrice = Math.min(maxPrice, worstPrice + PRICE_BUFFER);
+    const priceRaw = toRawUnits(bufferedPrice, dec, PRICE_STEP);
+    if (priceRaw <= 0n) continue;
+
+    // Size quantity from the LIMIT price, not the raw book prices, so
+    // priceRaw * quantityRaw never exceeds the collateral we commit.
+    const one = 10n ** BigInt(dec);
+    const maxQtyFromCollateral =
+      (user.remainingCollateralRaw * one) / priceRaw;
+    const maxSharesHuman = Number(
+      ethers.formatUnits(maxQtyFromCollateral, dec)
+    );
+    const quantityRaw = stepQuantityRaw(
+      Math.min(sharesGot, maxSharesHuman),
+      dec
+    );
+    if (quantityRaw <= 0n) continue;
+
+    let collateralRaw = (quantityRaw * priceRaw) / one;
+    // Floor division can still leave 1 wei of slack; clamp hard.
+    if (collateralRaw > user.remainingCollateralRaw) {
+      collateralRaw = user.remainingCollateralRaw;
+    }
+    if (collateralRaw <= 0n) continue;
+
+    plan.push({ wallet: user.wallet, quantityRaw, priceRaw, collateralRaw });
+    user.remainingCollateralRaw -= collateralRaw;
+  }
+  return plan;
+}
+
+/**
+ * Submit one already-sized fill for one user. Same tx-building / error-
+ * handling / DB-write path the old copyForUser used — the only thing that
+ * changed is where price+quantity came from (walked real depth, not a
+ * blind escalating guess).
+ */
+async function submitFill(wallet, signal, dec, fill) {
+  const sideCode = signal.side === "BUY_YES" ? 0 : 1;
+  const openParams = {
+    user: wallet,
+    marketId: signal.marketId,
+    side: sideCode,
+    collateral: fill.collateralRaw,
+    pool: signal.pool,
+    outcomeToken: signal.outcomeToken,
+    yesId: BigInt(signal.yesId),
+    noId: BigInt(signal.noId),
+    priceRaw: fill.priceRaw,
+    quantityRaw: fill.quantityRaw,
+    expireTimestampNs:
+      BigInt(
+        Math.floor(
+          Number(signal.expiryMs ?? Date.now() + 15 * 60_000) / 1000
+        )
+      ) * 1_000_000_000n,
+  };
+
+  let receipt, opened;
+  try {
+    const result = await executeTxWithRetry(async () => {
+      await withTimeout(
+        vault.openPositionFor.staticCall(openParams),
+        RPC_READ_TIMEOUT_MS,
+        "openPositionFor.staticCall()"
+      );
+      const tx = await vault.openPositionFor(openParams);
+      let rx;
+      try {
+        rx = await withTimeout(
+          tx.wait(),
+          RPC_TX_TIMEOUT_MS,
+          `openPositionFor tx.wait() (${tx.hash})`
+        );
+      } catch (waitErr) {
+        waitErr.isPostBroadcastTimeout = true;
+        waitErr.txHash = tx.hash;
+        throw waitErr;
+      }
+      return { tx, rx };
+    });
+
+    receipt = result.rx;
+    opened = receipt.logs
+      .map((l) => {
+        try {
+          return vault.interface.parseLog(l);
+        } catch {
+          return null;
+        }
+      })
+      .find((e) => e?.name === "PositionOpened");
+
+    if (!opened) {
+      throw new Error(
+        `tx ${receipt.hash} confirmed but missing PositionOpened event`
+      );
+    }
+  } catch (err) {
+    if (err.isPostBroadcastTimeout) {
+      log(
+        "signal",
+        `${wallet}: CRITICAL — tx ${err.txHash} broadcast but confirmation timed out. Verify on-chain manually before any retry.`
+      );
+      return false;
+    }
+    if (err.receipt || err.transactionHash) {
+      log(
+        "signal",
+        `${wallet}: tx execution failed on-chain: ${err.shortMessage ?? err.message}`
+      );
+      return false;
+    }
+    const reason = parseRevertReason(err, vault.interface);
+    log(
+      "signal",
+      `${wallet}: fill failed (limit ${Number(
+        ethers.formatUnits(fill.priceRaw, dec)
+      ).toFixed(4)}) → ${reason}`
+    );
+    return false;
+  }
+
+  try {
+    const positionId = Number(opened.args.positionId);
+    const usedCollateral = Number(
+      ethers.formatUnits(opened.args.collateral, dec)
+    );
+    const shares = Number(ethers.formatUnits(opened.args.shares, dec));
+    const entryPrice =
+      shares > 0 ? usedCollateral / shares : Number(signal.price);
+
+    db.prepare(
+      `
+      INSERT INTO copy_trades (
+        position_id, wallet_address, market_id, symbol, asset, window, side,
+        shares, collateral_at_entry, entry_price, tx_hash, status,
+        source_signal_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+    `
+    ).run(
+      positionId,
+      wallet,
+      signal.marketId,
+      signal.symbol ?? "",
+      signal.asset ?? "",
+      signal.window ?? "",
+      signal.side,
+      shares,
+      usedCollateral,
+      entryPrice,
+      receipt.hash,
+      signal.signalId ?? null,
+      Date.now()
+    );
+
+    recordEvent(
+      wallet,
+      "position_opened",
+      { positionId, marketId: signal.marketId, collateral: usedCollateral, shares },
+      receipt.hash
+    );
+
+    log(
+      "signal",
+      `opened position ${positionId} for ${wallet}: ${usedCollateral.toFixed(
+        2
+      )} collateral @ ${entryPrice.toFixed(4)} (book-walked) on ${signal.symbol}`
+    );
+    return true;
+  } catch (dbErr) {
+    log(
+      "signal",
+      `CRITICAL: Position opened on-chain (tx: ${receipt.hash}) but DB write failed: ${dbErr.message}`
+    );
+    return true; // it DID fill — never tell the caller to retry and risk a double-fill
+  }
+}
+
+/**
+ * Book-aware fill loop for one signal: on every poll tick, fetch the live
+ * ask depth once, walk it across every user who still has room (smallest
+ * remaining collateral first), submit whatever the book supports, then
+ * sleep. Repeats until either everyone's filled or the market's own cutoff
+ * arrives — so a signal that only had thin depth at first keeps checking
+ * for new liquidity right up to expiry instead of giving up after one look.
+ */
+async function fillAgainstBook(signal, dec, users) {
   const maxPriceCap = Math.min(
     Number(process.env.COPY_MAX_PRICE ?? ABSOLUTE_MAX_PRICE),
     ABSOLUTE_MAX_PRICE
   );
-
-  if (basePrice >= maxPriceCap) {
-    log(
-      "signal",
-      `${wallet}: skip — base price ${basePrice} is at or above cap ${maxPriceCap}`
-    );
-    return;
-  }
-
   const expiryMs = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
   const cutoffTimestamp = expiryMs - CUTOFF_BUFFER_MS;
 
- // 2. Initial freshness check 
-if (Date.now() > cutoffTimestamp) {
-  log("signal", `${wallet}: skip — past cutoff`);
-  return;
-}
-
-  // 3. Setup window expiry and cutoff window (defaults to 15m window)
-  const defaultBufferPrice = basePrice + Math.max(0.02, basePrice * 0.25);
-  const initialLimitPrice = Number(signal.limitPrice ?? defaultBufferPrice);
-  const targetPrice = Math.min(maxPriceCap, initialLimitPrice);
-
-  // Poll until real market cutoff — no artificial TTL abandon anymore
-  while (Date.now() < cutoffTimestamp) {
-    const timeLeftMs = cutoffTimestamp - Date.now();
-    const totalWindowMs = cutoffTimestamp - signalTimestamp;
-    const urgency = 1 - Math.max(0, Math.min(1, timeLeftMs / totalWindowMs));
-
-    const escalatedPrice = Math.min(
-      ABSOLUTE_MAX_PRICE,
-      targetPrice + (ABSOLUTE_MAX_PRICE - targetPrice) * urgency
+  if (!signal.venueSymbol) {
+    log(
+      "signal",
+      `${signal.symbol}: no venueSymbol on payload — can't size against the book, skipping`
     );
+    return;
+  }
+  if (Date.now() > cutoffTimestamp) {
+    log("signal", `${signal.symbol}: skip — already past cutoff`);
+    return;
+  }
 
-    const attempts = [
-      { price: escalatedPrice, scale: 1.0, label: `100% @ ${escalatedPrice.toFixed(4)}` },
-      { price: maxPriceCap, scale: 0.75, label: `75% @ ${maxPriceCap.toFixed(2)}` },
-      { price: maxPriceCap, scale: 0.5, label: `50% @ ${maxPriceCap.toFixed(2)}` },
-    ];
+  while (Date.now() < cutoffTimestamp) {
+    const remaining = users.filter((u) => u.remainingCollateralRaw > 0n);
+    if (remaining.length === 0) break;
 
-    for (let i = 0; i < attempts.length; i++) {
-      const attempt = attempts[i];
-      if (attempt.price > ABSOLUTE_MAX_PRICE) continue;
+    const asks = await fetchAskDepth(signal.venueSymbol);
+    if (asks) {
+      const levels = asks
+        .map((l) => ({ price: Number(l[0]), amount: Number(l[1]) }))
+        .filter((l) => l.price > 0 && l.amount > 0);
 
-      const currentColRaw =
-        (collateralRaw * BigInt(Math.round(attempt.scale * 100))) / 100n;
-      if (currentColRaw <= 0n) break;
-
-      const { priceRaw, quantityRaw, steppedQty } = rawPriceQty(
-        attempt.price,
-        currentColRaw,
-        dec
+      const plan = planFillsAgainstBook(remaining, levels, maxPriceCap, dec);
+      if (plan.length > 0) {
+        log(
+          "signal",
+          `${signal.symbol}: book supports ${plan.length}/${remaining.length} pending copier(s) this tick`
+        );
+      }
+      // Sequential on purpose (the shared tx queue serializes these anyway):
+      // each submission's on-chain effect should be reflected before the
+      // NEXT poll's book fetch, rather than racing several copiers against
+      // a book snapshot that's already stale by the time the second lands.
+      for (const fill of plan) {
+        await submitFill(fill.wallet, signal, dec, fill);
+      }
+    } else {
+      log(
+        "signal",
+        `${signal.symbol}: no book snapshot this tick — will retry`
       );
-      if (steppedQty <= 0) continue;
-
-      const sideCode = signal.side === "BUY_YES" ? 0 : 1;
-      const openParams = {
-        user: wallet,
-        marketId: signal.marketId,
-        side: sideCode,
-        collateral: currentColRaw,
-        pool: signal.pool,
-        outcomeToken: signal.outcomeToken,
-        yesId: BigInt(signal.yesId),
-        noId: BigInt(signal.noId),
-        priceRaw,
-        quantityRaw,
-        expireTimestampNs: BigInt(Math.floor(expiryMs / 1000)) * 1_000_000_000n,
-      };
-
-      let receipt, opened;
-      try {
-        const result = await executeTxWithRetry(async () => {
-          await withTimeout(
-            vault.openPositionFor.staticCall(openParams),
-            RPC_READ_TIMEOUT_MS,
-            "openPositionFor.staticCall()"
-          );
-          const tx = await vault.openPositionFor(openParams);
-          let rx;
-          try {
-            rx = await withTimeout(
-              tx.wait(),
-              RPC_TX_TIMEOUT_MS,
-              `openPositionFor tx.wait() (${tx.hash})`
-            );
-          } catch (waitErr) {
-            waitErr.isPostBroadcastTimeout = true;
-            waitErr.txHash = tx.hash;
-            throw waitErr;
-          }
-          return { tx, rx };
-        });
-
-        receipt = result.rx;
-        opened = receipt.logs
-          .map((l) => {
-            try { return vault.interface.parseLog(l); } catch { return null; }
-          })
-          .find((e) => e?.name === "PositionOpened");
-
-        if (!opened) {
-          throw new Error(`tx ${receipt.hash} confirmed but missing PositionOpened event`);
-        }
-      } catch (err) {
-        if (err.isPostBroadcastTimeout) {
-          log("signal", `${wallet}: CRITICAL — tx ${err.txHash} broadcast but confirmation timed out. Verify on-chain manually before any retry.`);
-          return;
-        }
-        if (err.receipt || err.transactionHash) {
-          log("signal", `${wallet}: tx execution failed on-chain: ${err.shortMessage ?? err.message}`);
-          return;
-        }
-        const reason = parseRevertReason(err, vault.interface);
-        log("signal", `${wallet}: probe failed (${attempt.label}) → ${reason}`);
-        continue;
-      }
-
-      try {
-        const positionId = Number(opened.args.positionId);
-        const usedCollateral = Number(ethers.formatUnits(opened.args.collateral, dec));
-        const shares = Number(ethers.formatUnits(opened.args.shares, dec));
-        const entryPrice = shares > 0 ? usedCollateral / shares : basePrice;
-
-        db.prepare(`
-          INSERT INTO copy_trades (
-            position_id, wallet_address, market_id, symbol, asset, window, side,
-            shares, collateral_at_entry, entry_price, tx_hash, status,
-            source_signal_id, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
-        `).run(
-          positionId, wallet, signal.marketId, signal.symbol ?? "", signal.asset ?? "",
-          signal.window ?? "", signal.side, shares, usedCollateral, entryPrice,
-          receipt.hash, signal.signalId ?? null, Date.now()
-        );
-
-        recordEvent(wallet, "position_opened",
-          { positionId, marketId: signal.marketId, collateral: usedCollateral, shares },
-          receipt.hash
-        );
-
-        log("signal", `opened position ${positionId} for ${wallet}: ${usedCollateral.toFixed(2)} collateral (${attempt.label}) on ${signal.symbol}`);
-      } catch (dbErr) {
-        log("signal", `CRITICAL: Position opened on-chain (tx: ${receipt.hash}) but DB write failed: ${dbErr.message}`);
-      }
-
-      return; // filled — done
     }
 
+    if (Date.now() >= cutoffTimestamp) break;
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 
-  log("signal", `${wallet}: retry window closed for ${signal.symbol} (reached expiry cutoff)`);
+  const stillShort = users.filter((u) => u.remainingCollateralRaw > 0n);
+  if (stillShort.length > 0) {
+    log(
+      "signal",
+      `${signal.symbol}: cutoff reached with ${stillShort.length} copier(s) still short of full size`
+    );
+  }
 }
 
 async function handleSignal(signal) {
@@ -543,7 +700,6 @@ async function handleSignal(signal) {
     `${signal.symbol} ${signal.side} — checking ${wallets.length} known wallet(s)`
   );
 
-  // 1. Pre-fetch account states in parallel
   const userAccounts = await Promise.all(
     wallets.map(async (w) => {
       const [balance, , copyEnabled, tradeSize] = await vault
@@ -552,22 +708,14 @@ async function handleSignal(signal) {
           log("signal", `getAccount failed for ${w}: ${e.message}`);
           return [0n, 0n, false, 0n];
         });
-
       if (!copyEnabled) return null;
-
       const rawCollateral = tradeSize < balance ? tradeSize : balance;
       if (rawCollateral <= 0n) return null;
-
-      return {
-        wallet: w,
-        collateralRaw: rawCollateral,
-      };
+      return { wallet: w, remainingCollateralRaw: rawCollateral };
     })
   );
 
-  // Filter out null / zero balance copiers
   let eligible = userAccounts.filter((u) => u !== null);
-
   if (eligible.length === 0) {
     log(
       "signal",
@@ -576,16 +724,16 @@ async function handleSignal(signal) {
     return;
   }
 
-  // 2. Sort by ascending trade collateral size (smaller sizes filled first)
+  // Smallest requested size first — protects small accounts from getting
+  // starved behind one big account soaking up all available depth.
   eligible.sort((a, b) =>
-    a.collateralRaw < b.collateralRaw
+    a.remainingCollateralRaw < b.remainingCollateralRaw
       ? -1
-      : a.collateralRaw > b.collateralRaw
+      : a.remainingCollateralRaw > b.remainingCollateralRaw
       ? 1
       : 0
   );
 
-  // 3. Cap aggregate collateral vs book/max limit
   const envMaxAgg = process.env.COPY_MAX_AGGREGATE_COLLATERAL;
   const maxAggregateCollateral =
     typeof signal.maxAggregateCollateral === "number"
@@ -595,16 +743,16 @@ async function handleSignal(signal) {
       : null;
 
   const totalRequestedCollateral = eligible.reduce(
-    (sum, item) => sum + Number(ethers.formatUnits(item.collateralRaw, dec)),
+    (sum, item) =>
+      sum + Number(ethers.formatUnits(item.remainingCollateralRaw, dec)),
     0
   );
 
-  let scaleFactor = 1.0;
   if (
     maxAggregateCollateral &&
     totalRequestedCollateral > maxAggregateCollateral
   ) {
-    scaleFactor = maxAggregateCollateral / totalRequestedCollateral;
+    const scaleFactor = maxAggregateCollateral / totalRequestedCollateral;
     log(
       "signal",
       `Aggregate size (${totalRequestedCollateral.toFixed(
@@ -613,25 +761,18 @@ async function handleSignal(signal) {
         2
       )}). Scaling per-user size by ${(scaleFactor * 100).toFixed(1)}%`
     );
+    for (const item of eligible) {
+      const scaled =
+        Number(ethers.formatUnits(item.remainingCollateralRaw, dec)) *
+        scaleFactor;
+      item.remainingCollateralRaw = ethers.parseUnits(
+        scaled.toFixed(dec),
+        dec
+      );
+    }
   }
 
-  // 4. Serialize opens sequentially
-  await Promise.allSettled(
-    eligible.map((item) => {
-      let finalCollateralRaw = item.collateralRaw;
-
-      if (scaleFactor < 1.0) {
-        const scaledCollateral =
-          Number(ethers.formatUnits(item.collateralRaw, dec)) * scaleFactor;
-        finalCollateralRaw = ethers.parseUnits(
-          scaledCollateral.toFixed(dec),
-          dec
-        );
-      }
-
-      return copyForUser(item.wallet, signal, dec, finalCollateralRaw);
-    })
-  );
+  await fillAgainstBook(signal, dec, eligible);
 }
 
 // ── Settlement handling ─────────────────────────────────────────────
