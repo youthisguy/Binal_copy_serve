@@ -318,7 +318,7 @@ const PRICE_STEP = Number(process.env.COPY_PRICE_STEP ?? 0.0001); // 4dp price t
 // needed, mirroring the `+0.002` cushion index.ts uses on its own IOCs —
 // gives the tx a little room against the book moving between our snapshot
 // and the broadcast landing.
-const PRICE_BUFFER = Number(process.env.COPY_PRICE_BUFFER ?? 0.002);
+const PRICE_BUFFER = Number(process.env.COPY_PRICE_BUFFER ?? 0.01);  
 
 function toRawUnits(human, dec, step) {
   const one = 10n ** BigInt(dec);
@@ -453,10 +453,11 @@ function planFillsAgainstBook(users, levels, maxPrice, dec) {
     if (collateralRaw > user.remainingCollateralRaw) {
       collateralRaw = user.remainingCollateralRaw;
     }
-    if (collateralRaw <= 0n) continue;
-
+    // Skip dust — vault can still emit PositionOpened with ~0 shares.
+    const minCollateralRaw = ethers.parseUnits("0.01", dec);
+    if (collateralRaw < minCollateralRaw) continue;
+    
     plan.push({ wallet: user.wallet, quantityRaw, priceRaw, collateralRaw });
-    user.remainingCollateralRaw -= collateralRaw;
   }
   return plan;
 }
@@ -559,9 +560,19 @@ async function submitFill(wallet, signal, dec, fill) {
       ethers.formatUnits(opened.args.collateral, dec)
     );
     const shares = Number(ethers.formatUnits(opened.args.shares, dec));
+
+    const MIN_COLLATERAL = Number(process.env.COPY_MIN_COLLATERAL ?? 0.01);
+    if (usedCollateral < MIN_COLLATERAL || shares <= 0) {
+      log(
+        "signal",
+        `${wallet}: ignoring dust fill position ${positionId} (collateral=${usedCollateral.toFixed(6)}, shares=${shares}) — not recording`
+      );
+      return false;
+    }
+  
     const entryPrice =
       shares > 0 ? usedCollateral / shares : Number(signal.price);
-
+  
     db.prepare(
       `
       INSERT INTO copy_trades (
@@ -618,9 +629,14 @@ async function submitFill(wallet, signal, dec, fill) {
  * for new liquidity right up to expiry instead of giving up after one look.
  */
 async function fillAgainstBook(signal, dec, users) {
+  const signalPx = Number(signal.price);
+  const maxSlippage = Number(process.env.COPY_MAX_SLIPPAGE ?? 0.05);
   const maxPriceCap = Math.min(
     Number(process.env.COPY_MAX_PRICE ?? ABSOLUTE_MAX_PRICE),
-    ABSOLUTE_MAX_PRICE
+    ABSOLUTE_MAX_PRICE,
+    Number.isFinite(signalPx) && signalPx > 0
+      ? signalPx + maxSlippage
+      : ABSOLUTE_MAX_PRICE
   );
   const expiryMs = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
   const cutoffTimestamp = expiryMs - CUTOFF_BUFFER_MS;
@@ -659,7 +675,16 @@ async function fillAgainstBook(signal, dec, users) {
       // NEXT poll's book fetch, rather than racing several copiers against
       // a book snapshot that's already stale by the time the second lands.
       for (const fill of plan) {
-        await submitFill(fill.wallet, signal, dec, fill);
+        const ok = await submitFill(fill.wallet, signal, dec, fill);
+        if (ok) {
+          const u = users.find((x) => x.wallet === fill.wallet);
+          if (u) {
+            u.remainingCollateralRaw =
+              u.remainingCollateralRaw > fill.collateralRaw
+                ? u.remainingCollateralRaw - fill.collateralRaw
+                : 0n;
+          }
+        }
       }
     } else {
       log(
@@ -896,13 +921,17 @@ async function handleSettlement(settlement) {
       } catch (e) {
         const parsedErr = parseRevertReason(e, vault.interface);
 
-        // Market was already redeemed by an earlier webhook delivery — this
-        // means the on-chain state we need is already in place, so treat it
-        // as success and proceed to settle positions instead of aborting.
-        if (/already redeemed/i.test(parsedErr) || /AlreadyRedeemed/.test(parsedErr)) {
+        // Already redeemed, or nothing to redeem (e.g. LOSS side / empty
+        // inventory) — on-chain is in a state where settlePosition can run.
+        // Do not abort the whole batch.
+        if (
+          /already redeemed/i.test(parsedErr) ||
+          /AlreadyRedeemed/.test(parsedErr) ||
+          /nothing to redeem/i.test(parsedErr)
+        ) {
           log(
             "settlement",
-            `redeemMarket: ${targetMarket} already redeemed on-chain — proceeding to settle positions`
+            `redeemMarket: ${targetMarket} — ${parsedErr}; proceeding to settle positions`
           );
           redeemed = true;
           break;
