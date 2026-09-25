@@ -25,7 +25,9 @@ const QTY_STEP = Number(process.env.COPY_QTY_STEP ?? 0.01);
 const WEBHOOK_SECRET = process.env.COPY_WEBHOOK_SECRET;
 const POLL_INTERVAL_MS = 3_000; // Check order book every 3 seconds
 const CUTOFF_BUFFER_MS = 1 * 60 * 1000; // Stop 1 minutes before expiry
-const RPC_READ_TIMEOUT_MS = Number(process.env.COPY_RPC_READ_TIMEOUT_MS ?? 15_000);
+const RPC_READ_TIMEOUT_MS = Number(
+  process.env.COPY_RPC_READ_TIMEOUT_MS ?? 15_000
+);
 const RPC_TX_TIMEOUT_MS = Number(process.env.COPY_RPC_TX_TIMEOUT_MS ?? 150_000);
 
 if (!RPC_URL || !VAULT_ADDRESS || !OPERATOR_KEY) {
@@ -95,7 +97,7 @@ function parseRevertReason(err, contractInterface) {
           : `${parsed.name}()`;
       }
     } catch {
-      return `Unknown Custom Error [Selector: ${rawData.slice(0, 10)}]`;
+      return `Unknown Custom Error [data: ${rawData.slice(0, 74)}]`;
     }
   }
 
@@ -146,6 +148,9 @@ async function decimals() {
 
 const log = (scope, s) =>
   console.log(`${new Date().toISOString()} [${scope}] ${s}`);
+
+/** One in-flight settlement per marketId — repeated webhooks must not double-redeem. */
+const settlementInFlight = new Map();
 
 // Wraps a promise so a hung RPC call throws instead of stalling forever.
 function withTimeout(promise, ms, label) {
@@ -205,7 +210,9 @@ async function executeTxWithRetry(txFn, maxRetries = 3, initialDelayMs = 200) {
       if (err.isPostBroadcastTimeout) {
         log(
           "tx",
-          `Broadcast tx ${err.txHash ?? "unknown"} timed out waiting for confirmation — NOT retrying, verify on-chain manually.`
+          `Broadcast tx ${
+            err.txHash ?? "unknown"
+          } timed out waiting for confirmation — NOT retrying, verify on-chain manually.`
         );
         throw err;
       }
@@ -318,7 +325,7 @@ const PRICE_STEP = Number(process.env.COPY_PRICE_STEP ?? 0.0001); // 4dp price t
 // needed, mirroring the `+0.002` cushion index.ts uses on its own IOCs —
 // gives the tx a little room against the book moving between our snapshot
 // and the broadcast landing.
-const PRICE_BUFFER = Number(process.env.COPY_PRICE_BUFFER ?? 0.01);  
+const PRICE_BUFFER = Number(process.env.COPY_PRICE_BUFFER ?? 0.01);
 
 function toRawUnits(human, dec, step) {
   const one = 10n ** BigInt(dec);
@@ -381,7 +388,9 @@ async function fetchAskDepth(venueSymbol) {
     if (age > ORDERBOOK_MAX_AGE_MS) {
       log(
         "orderbook",
-        `snapshot for ${venueSymbol} is stale (${Math.round(age / 1000)}s old) — treating as no data`
+        `snapshot for ${venueSymbol} is stale (${Math.round(
+          age / 1000
+        )}s old) — treating as no data`
       );
       return null;
     }
@@ -437,8 +446,7 @@ function planFillsAgainstBook(users, levels, maxPrice, dec) {
     // Size quantity from the LIMIT price, not the raw book prices, so
     // priceRaw * quantityRaw never exceeds the collateral we commit.
     const one = 10n ** BigInt(dec);
-    const maxQtyFromCollateral =
-      (user.remainingCollateralRaw * one) / priceRaw;
+    const maxQtyFromCollateral = (user.remainingCollateralRaw * one) / priceRaw;
     const maxSharesHuman = Number(
       ethers.formatUnits(maxQtyFromCollateral, dec)
     );
@@ -456,7 +464,7 @@ function planFillsAgainstBook(users, levels, maxPrice, dec) {
     // Skip dust — vault can still emit PositionOpened with ~0 shares.
     const minCollateralRaw = ethers.parseUnits("0.01", dec);
     if (collateralRaw < minCollateralRaw) continue;
-    
+
     plan.push({ wallet: user.wallet, quantityRaw, priceRaw, collateralRaw });
   }
   return plan;
@@ -483,9 +491,7 @@ async function submitFill(wallet, signal, dec, fill) {
     quantityRaw: fill.quantityRaw,
     expireTimestampNs:
       BigInt(
-        Math.floor(
-          Number(signal.expiryMs ?? Date.now() + 15 * 60_000) / 1000
-        )
+        Math.floor(Number(signal.expiryMs ?? Date.now() + 15 * 60_000) / 1000)
       ) * 1_000_000_000n,
   };
 
@@ -540,7 +546,9 @@ async function submitFill(wallet, signal, dec, fill) {
     if (err.receipt || err.transactionHash) {
       log(
         "signal",
-        `${wallet}: tx execution failed on-chain: ${err.shortMessage ?? err.message}`
+        `${wallet}: tx execution failed on-chain: ${
+          err.shortMessage ?? err.message
+        }`
       );
       return false;
     }
@@ -565,14 +573,16 @@ async function submitFill(wallet, signal, dec, fill) {
     if (usedCollateral < MIN_COLLATERAL || shares <= 0) {
       log(
         "signal",
-        `${wallet}: ignoring dust fill position ${positionId} (collateral=${usedCollateral.toFixed(6)}, shares=${shares}) — not recording`
+        `${wallet}: ignoring dust fill position ${positionId} (collateral=${usedCollateral.toFixed(
+          6
+        )}, shares=${shares}) — not recording`
       );
       return false;
     }
-  
+
     const entryPrice =
       shares > 0 ? usedCollateral / shares : Number(signal.price);
-  
+
     db.prepare(
       `
       INSERT INTO copy_trades (
@@ -600,7 +610,12 @@ async function submitFill(wallet, signal, dec, fill) {
     recordEvent(
       wallet,
       "position_opened",
-      { positionId, marketId: signal.marketId, collateral: usedCollateral, shares },
+      {
+        positionId,
+        marketId: signal.marketId,
+        collateral: usedCollateral,
+        shares,
+      },
       receipt.hash
     );
 
@@ -608,7 +623,9 @@ async function submitFill(wallet, signal, dec, fill) {
       "signal",
       `opened position ${positionId} for ${wallet}: ${usedCollateral.toFixed(
         2
-      )} collateral @ ${entryPrice.toFixed(4)} (book-walked) on ${signal.symbol}`
+      )} collateral @ ${entryPrice.toFixed(4)} (book-walked) on ${
+        signal.symbol
+      }`
     );
     return true;
   } catch (dbErr) {
@@ -653,6 +670,9 @@ async function fillAgainstBook(signal, dec, users) {
     return;
   }
 
+  let consecutiveMisses = 0;
+  const MAX_CONSECUTIVE_MISSES = Number(process.env.COPY_MAX_EMPTY_TICKS ?? 8);
+
   while (Date.now() < cutoffTimestamp) {
     const remaining = users.filter((u) => u.remainingCollateralRaw > 0n);
     if (remaining.length === 0) break;
@@ -663,20 +683,67 @@ async function fillAgainstBook(signal, dec, users) {
         .map((l) => ({ price: Number(l[0]), amount: Number(l[1]) }))
         .filter((l) => l.price > 0 && l.amount > 0);
 
-      const plan = planFillsAgainstBook(remaining, levels, maxPriceCap, dec);
+      // Live depth under the price cap (notional ≈ price × size)
+      const availableNotional = levels
+        .filter((l) => l.price <= maxPriceCap)
+        .reduce((s, l) => s + l.price * l.amount, 0);
+      const wantNotional = remaining.reduce(
+        (s, u) => s + Number(ethers.formatUnits(u.remainingCollateralRaw, dec)),
+        0
+      );
+
+      // Scale a COPY for this tick only — never permanently shrink remaining
+      // so later ticks can use full demand if depth recovers.
+      let planUsers = remaining;
+      if (availableNotional > 0 && wantNotional > availableNotional * 0.9) {
+        const scale = (availableNotional * 0.9) / wantNotional;
+        log(
+          "signal",
+          `${signal.symbol}: depth ${availableNotional.toFixed(
+            2
+          )} < demand ${wantNotional.toFixed(2)} — scaling plan ×${(
+            scale * 100
+          ).toFixed(0)}%`
+        );
+        planUsers = remaining.map((u) => {
+          const h =
+            Number(ethers.formatUnits(u.remainingCollateralRaw, dec)) * scale;
+          return {
+            wallet: u.wallet,
+            remainingCollateralRaw: ethers.parseUnits(
+              Math.max(h, 0).toFixed(Math.min(dec, 8)),
+              dec
+            ),
+          };
+        });
+      }
+
+      const plan = planFillsAgainstBook(planUsers, levels, maxPriceCap, dec);
+
       if (plan.length > 0) {
         log(
           "signal",
-          `${signal.symbol}: book supports ${plan.length}/${remaining.length} pending copier(s) this tick`
+          `${signal.symbol}: book supports ${plan.length}/${
+            remaining.length
+          } pending copier(s) this tick (cap=${maxPriceCap.toFixed(
+            3
+          )} depth≈${availableNotional.toFixed(2)})`
+        );
+      } else {
+        log(
+          "signal",
+          `${signal.symbol}: no fillable depth under cap ${maxPriceCap.toFixed(
+            3
+          )} (miss ${consecutiveMisses + 1}/${MAX_CONSECUTIVE_MISSES})`
         );
       }
-      // Sequential on purpose (the shared tx queue serializes these anyway):
-      // each submission's on-chain effect should be reflected before the
-      // NEXT poll's book fetch, rather than racing several copiers against
-      // a book snapshot that's already stale by the time the second lands.
+
+      let anyOk = false;
       for (const fill of plan) {
         const ok = await submitFill(fill.wallet, signal, dec, fill);
         if (ok) {
+          anyOk = true;
+          consecutiveMisses = 0;
           const u = users.find((x) => x.wallet === fill.wallet);
           if (u) {
             u.remainingCollateralRaw =
@@ -686,11 +753,23 @@ async function fillAgainstBook(signal, dec, users) {
           }
         }
       }
+
+      if (plan.length === 0 || !anyOk) {
+        consecutiveMisses++;
+      }
     } else {
+      consecutiveMisses++;
       log(
         "signal",
-        `${signal.symbol}: no book snapshot this tick — will retry`
+        `${signal.symbol}: no book snapshot this tick — will retry (miss ${consecutiveMisses}/${MAX_CONSECUTIVE_MISSES})`
       );
+    }
+    if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES) {
+      log(
+        "signal",
+        `${signal.symbol}: giving up after ${consecutiveMisses} empty ticks`
+      );
+      break;
     }
 
     if (Date.now() >= cutoffTimestamp) break;
@@ -790,10 +869,7 @@ async function handleSignal(signal) {
       const scaled =
         Number(ethers.formatUnits(item.remainingCollateralRaw, dec)) *
         scaleFactor;
-      item.remainingCollateralRaw = ethers.parseUnits(
-        scaled.toFixed(dec),
-        dec
-      );
+      item.remainingCollateralRaw = ethers.parseUnits(scaled.toFixed(dec), dec);
     }
   }
 
@@ -810,7 +886,6 @@ async function handleSettlement(settlement) {
     return;
   }
 
-  // 1. Flexible market identifier extraction
   const targetMarket =
     settlement.marketId ||
     settlement.market_id ||
@@ -825,8 +900,25 @@ async function handleSettlement(settlement) {
     return;
   }
 
+  const lockKey = String(targetMarket).toLowerCase();
+  if (settlementInFlight.has(lockKey)) {
+    log(
+      "settlement",
+      `skip — settlement already in flight for "${targetMarket}"`
+    );
+    return;
+  }
+  settlementInFlight.set(lockKey, true);
   log("settlement", `Received settlement webhook for: "${targetMarket}"`);
 
+  try {
+    await handleSettlementBody(settlement, targetMarket);
+  } finally {
+    settlementInFlight.delete(lockKey);
+  }
+}
+
+async function handleSettlementBody(settlement, targetMarket) {
   // 2. Case-insensitive lookup across both market_id AND symbol columns
   const open = db
     .prepare(
@@ -907,11 +999,41 @@ async function handleSettlement(settlement) {
         const redeemTx = await executeTxWithRetry(() =>
           vault.redeemMarket(open[0].market_id, sideCode)
         );
-        const redeemReceipt = await withTimeout(
-          redeemTx.wait(),
-          RPC_TX_TIMEOUT_MS,
-          `redeemTx.wait() (${redeemTx.hash})`
-        );
+        let redeemReceipt;
+        try {
+          redeemReceipt = await withTimeout(
+            redeemTx.wait(),
+            RPC_TX_TIMEOUT_MS,
+            `redeemTx.wait() (${redeemTx.hash})`
+          );
+        } catch (waitErr) {
+          // Tx may still confirm — do NOT send another redeem on this attempt.
+          log(
+            "settlement",
+            `redeemMarket wait timed out for ${redeemTx.hash} — polling receipt before retry`
+          );
+          for (let p = 0; p < 6; p++) {
+            await new Promise((r) => setTimeout(r, 15_000));
+            const mined = await provider
+              .getTransactionReceipt(redeemTx.hash)
+              .catch(() => null);
+            if (mined) {
+              if (mined.status === 1) {
+                log(
+                  "settlement",
+                  `redeemMarket ${open[0].market_id} side=${sideCode} tx=${redeemTx.hash} confirmed late`
+                );
+                redeemed = true;
+                break;
+              }
+              throw new Error(
+                `redeemMarket reverted on-chain: ${redeemTx.hash}`
+              );
+            }
+          }
+          if (redeemed) break;
+          throw waitErr;
+        }
         log(
           "settlement",
           `redeemMarket ${open[0].market_id} side=${sideCode} tx=${redeemReceipt.hash}`
