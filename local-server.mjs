@@ -672,12 +672,31 @@ async function fillAgainstBook(signal, dec, users) {
 
   let consecutiveMisses = 0;
   const MAX_CONSECUTIVE_MISSES = Number(process.env.COPY_MAX_EMPTY_TICKS ?? 8);
+  let usedSignalResidual = false; // only trust the payload's own snapshot once
 
   while (Date.now() < cutoffTimestamp) {
     const remaining = users.filter((u) => u.remainingCollateralRaw > 0n);
     if (remaining.length === 0) break;
 
-    const asks = await fetchAskDepth(signal.venueSymbol);
+    let asks;
+    if (!usedSignalResidual && Array.isArray(signal.remainingAsks)) {
+      usedSignalResidual = true;
+      asks = signal.remainingAsks.length > 0 ? signal.remainingAsks : null;
+      if (!asks) {
+        log(
+          "signal",
+          `${signal.symbol}: signal carried no residual depth — bot's own fill exhausted the book under cap`
+        );
+      } else {
+        log(
+          "signal",
+          `${signal.symbol}: using post-fill residual from signal (${asks.length} level(s)) instead of polling`
+        );
+      }
+    } else {
+      asks = await fetchAskDepth(signal.venueSymbol);
+    }
+
     if (asks) {
       const levels = asks
         .map((l) => ({ price: Number(l[0]), amount: Number(l[1]) }))
