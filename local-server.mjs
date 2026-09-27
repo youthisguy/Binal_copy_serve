@@ -14,6 +14,13 @@ import { createServer } from "node:http";
 import { ethers, NonceManager } from "ethers";
 import Database from "better-sqlite3";
 import { timingSafeEqual } from "node:crypto";
+import path from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 // ── Config ──────────────────────────────────────────────────────────
 const RPC_URL = process.env.COPY_RPC_URL;
@@ -242,6 +249,12 @@ async function executeTxWithRetry(txFn, maxRetries = 3, initialDelayMs = 200) {
 }
 
 // ── DB setup ────────────────────────────────────────────────────────
+// better-sqlite3 does NOT create missing parent directories — without
+// this, a fresh deploy with COPY_DB_PATH="data/copy-trade.db" crashes on
+// boot with ENOENT the first time (before restore-and-start.sh's git
+// checkout has ever had a chance to create anything either, since git
+// doesn't track empty directories).
+mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -309,6 +322,113 @@ function knownWallets() {
     .map((r) => r.wallet_address);
 }
 
+// ── Checkpoint (git-backed persistence) ──
+// Same mechanism the main bot uses for logs/decisions.jsonl (see
+// checkpoint.ts): commit + push COPY_CHECKPOINT_PATHS any time this service
+// records a real position-open or settlement, so a crash/redeploy restores
+// copy_trades/users/user_events from GitHub instead of an empty DB.
+// Opt-in and silent when GITHUB_REPO/GITHUB_TOKEN aren't set, same as the
+// bot side.
+const CHECKPOINT_PATHS =
+  process.env.COPY_CHECKPOINT_PATHS ?? path.dirname(DB_PATH);
+
+let checkpointWarned = false;
+function checkpointConfigured() {
+  if (!process.env.GITHUB_REPO || !process.env.GITHUB_TOKEN) return false;
+  if (CHECKPOINT_PATHS === "." || CHECKPOINT_PATHS === "") {
+    // Refuse to checkpoint the whole repo root by accident. Point
+    // COPY_DB_PATH at a subdirectory (e.g. "data/copy-trade.db") or set
+    // COPY_CHECKPOINT_PATHS explicitly.
+    if (!checkpointWarned) {
+      checkpointWarned = true;
+      log(
+        "checkpoint",
+        `GITHUB_REPO/GITHUB_TOKEN set but COPY_DB_PATH="${DB_PATH}" has no ` +
+          `subdirectory — refusing to checkpoint the whole repo. Set ` +
+          `COPY_DB_PATH to e.g. "data/copy-trade.db" or set ` +
+          `COPY_CHECKPOINT_PATHS explicitly.`
+      );
+    }
+    return false;
+  }
+  return true;
+}
+
+// Locate the repo root the same way checkpoint.ts does, independent of
+// process.cwd() — walk up from this file's own location.
+function findRepoRoot(startDir) {
+  let dir = startDir;
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(path.join(dir, "scripts", "checkpoint.sh"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // hit filesystem root
+    dir = parent;
+  }
+  throw new Error(
+    `could not locate scripts/checkpoint.sh by walking up from ${startDir}`
+  );
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+let cachedRepoRoot = null;
+function repoRoot() {
+  if (cachedRepoRoot === null) cachedRepoRoot = findRepoRoot(__dirname);
+  return cachedRepoRoot;
+}
+
+async function runCheckpointScript() {
+  const cwd = repoRoot();
+  const scriptPath = path.join(cwd, "scripts", "checkpoint.sh");
+  // Override CHECKPOINT_PATHS for just this call so the copy service's own
+  // data dir is what gets committed, regardless of whatever the bot
+  // process's own env has that var set to.
+  const env = { ...process.env, CHECKPOINT_PATHS };
+  try {
+    const { stdout, stderr } = await execFileAsync("bash", [scriptPath], {
+      cwd,
+      env,
+      timeout: 60_000,
+    });
+    return { ok: true, output: (stdout + stderr).trim() };
+  } catch (err) {
+    const output = String((err?.stdout ?? "") + (err?.stderr ?? "")).trim();
+    return { ok: false, output: output || err.message };
+  }
+}
+
+let checkpointQueue = Promise.resolve();
+let checkpointPending = 0;
+const MAX_QUEUED_CHECKPOINTS = 2; // one running + one queued covers a burst
+
+/**
+ * Fire-and-forget checkpoint trigger
+ */
+function scheduleCheckpoint(reason) {
+  if (!checkpointConfigured()) return;
+  if (checkpointPending >= MAX_QUEUED_CHECKPOINTS) return;
+  checkpointPending++;
+  checkpointQueue = checkpointQueue
+    .then(async () => {
+      let result;
+      try {
+        result = await runCheckpointScript();
+      } catch (e) {
+        result = { ok: false, output: e.message };
+      }
+      if (!result.ok) {
+        log("checkpoint", `(${reason}) failed: ${result.output}`);
+      } else if (
+        result.output &&
+        !result.output.includes("nothing to commit")
+      ) {
+        log("checkpoint", `(${reason}): ${result.output}`);
+      }
+    })
+    .finally(() => {
+      checkpointPending--;
+    });
+}
+
 function isValidWebhookSecret(req) {
   const supplied = req.headers["x-webhook-secret"];
   if (typeof supplied !== "string" || supplied.length === 0) return false;
@@ -344,10 +464,7 @@ function stepQuantityRaw(sharesHuman, dec) {
 // ── Order-book depth from the main bot ──────────────────────────────
 // the bot's own live book snapshot walks price levels against REAL
 // depth, then polls for new depth for anyone still short.
-// BOT_ORDERBOOK_URL is the bot's own base URL, e.g.
-// https://dreamdex-binal-bot-5by9.onrender.com — same host that serves the
-// dashboard at /index.html. No secret needed: this route is public read-only
-// market depth, same as /volume-pulse.json and /decisions.jsonl.
+// BOT_ORDERBOOK_URL is the bot's own base URL
 const BOT_ORDERBOOK_URL = process.env.BOT_ORDERBOOK_URL;
 const ORDERBOOK_FETCH_TIMEOUT_MS = Number(
   process.env.COPY_ORDERBOOK_TIMEOUT_MS ?? 5_000
@@ -618,6 +735,7 @@ async function submitFill(wallet, signal, dec, fill) {
       },
       receipt.hash
     );
+    scheduleCheckpoint(`position_opened:${positionId}`);
 
     log(
       "signal",
@@ -1120,6 +1238,7 @@ async function handleSettlementBody(settlement, targetMarket) {
         db.prepare(
           `UPDATE copy_trades SET status='SETTLED' WHERE position_id=?`
         ).run(trade.position_id);
+        scheduleCheckpoint(`position_synced:${trade.position_id}`);
         continue;
       }
       if (Math.abs(onchainShares - trade.shares) > 1e-6) {
@@ -1183,6 +1302,7 @@ async function handleSettlementBody(settlement, targetMarket) {
         { positionId: trade.position_id, outcome: settlement.outcome, netPnl },
         receipt.hash
       );
+      scheduleCheckpoint(`position_settled:${trade.position_id}`);
       log(
         "settlement",
         `settled position ${trade.position_id} (${trade.wallet_address}): ${
@@ -1275,8 +1395,13 @@ const routes = {
     if (!isAddress(wallet))
       return json(res, 400, { error: "invalid wallet address" });
     const w = wallet.toLowerCase();
+    const isNew = !db
+      .prepare(`SELECT 1 FROM users WHERE wallet_address = ?`)
+      .get(w);
     upsertUser(w);
     recordEvent(w, "registered");
+    log("register", `wallet ${w} registered (new: ${isNew})`);
+    if (isNew) scheduleCheckpoint(`registered:${w}`);
     return json(res, 200, { ok: true });
   },
 
@@ -1384,6 +1509,15 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, () => {
   log("server", `listening on port ${PORT}`);
   log("server", `vault: ${VAULT_ADDRESS}, operator: ${rawWallet.address}`);
+  log("server", `db path: ${DB_PATH}`);
+  log(
+    "checkpoint",
+    checkpointConfigured()
+      ? `enabled, paths="${CHECKPOINT_PATHS}"`
+      : `DISABLED (GITHUB_REPO/TOKEN set: ${Boolean(
+          process.env.GITHUB_REPO && process.env.GITHUB_TOKEN
+        )}, paths="${CHECKPOINT_PATHS}")`
+  );
 
   // Background interval to report stuck OPEN trades
   setInterval(() => {

@@ -15,6 +15,10 @@ copy-trade.db-journal
 logs/
 *.log
 
+# ...except the checkpointed copy-service DB (scripts/checkpoint.sh commits data/)
+!data/
+!data/*.db
+
 # Build output
 dist/
 build/
