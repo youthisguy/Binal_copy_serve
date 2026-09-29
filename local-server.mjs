@@ -487,33 +487,22 @@ const ABSOLUTE_MAX_PRICE = 0.9; // never fill higher than 0.90, capped against d
 async function fetchAskDepth(venueSymbol) {
   if (!BOT_ORDERBOOK_URL) return null;
   try {
-    const url = `${BOT_ORDERBOOK_URL}/orderbook-snapshot.json`;
+    const url = `${BOT_ORDERBOOK_URL}/api/live-book?symbol=${encodeURIComponent(
+      venueSymbol
+    )}`;
     const res = await withTimeout(
       fetch(url),
       ORDERBOOK_FETCH_TIMEOUT_MS,
       "fetchAskDepth"
     );
     if (!res.ok) {
-      log("orderbook", `bot returned HTTP ${res.status}`);
+      log("orderbook", `bot returned HTTP ${res.status} for ${venueSymbol}`);
       return null;
     }
     const data = await res.json();
-    const entry = data?.books?.[venueSymbol];
-    if (!entry) return null; // bot hasn't scanned/traded this symbol recently
-
-    const age = Date.now() - entry.updatedAt;
-    if (age > ORDERBOOK_MAX_AGE_MS) {
-      log(
-        "orderbook",
-        `snapshot for ${venueSymbol} is stale (${Math.round(
-          age / 1000
-        )}s old) — treating as no data`
-      );
-      return null;
-    }
-    return Array.isArray(entry.asks) ? entry.asks : null; // [[price, amount], ...] ascending
+    return Array.isArray(data.asks) ? data.asks : null; // [[price, amount], ...] ascending
   } catch (e) {
-    log("orderbook", `fetch failed: ${e.message}`);
+    log("orderbook", `live-book fetch failed for ${venueSymbol}: ${e.message}`);
     return null;
   }
 }
