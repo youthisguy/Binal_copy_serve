@@ -14,7 +14,7 @@ import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contr
  *   - After placeBinaryOrder, net collateral spent is measured via balance
  *     delta (handles better fill price + exchange refunds).
  *   - Unspent collateral is refunded to the user's idle balance.
- *   - shares = quantityRaw (full-fill assumption).
+ *   - shares are measured via outcome-token balance delta.
  * Settlement funding:
  *   1) Operator calls redeemMarket(marketId, winningSide) once after resolution
  *      → redeemNative on the collateral router → collateral into marketPot.
@@ -53,9 +53,18 @@ interface IBinaryModule {
 }
 
 interface IOutcomeToken {
-    function balanceOf(address account, uint256 id) external view returns (uint256);
-    function setOperator(address operator, bool approved) external returns (bool);
-    function isOperator(address owner, address spender) external view returns (bool);
+    function balanceOf(
+        address account,
+        uint256 id
+    ) external view returns (uint256);
+    function setOperator(
+        address operator,
+        bool approved
+    ) external returns (bool);
+    function isOperator(
+        address owner,
+        address spender
+    ) external view returns (bool);
 }
 
 contract CopyVault is Ownable, ReentrancyGuard {
@@ -65,9 +74,11 @@ contract CopyVault is Ownable, ReentrancyGuard {
     IERC20 public immutable collateralToken;
     uint8 public immutable collateralDecimals;
     uint256 public constant MAX_FEE_BPS = 2000;
+    uint256 public constant MAX_BATCH_SIZE = 50;
     uint256 public feeBps;
     address public feeRecipient;
     address public operator;
+    address public houseAccount;
 
     // DreamDEX venue identifiers
     address public immutable binaryModule;
@@ -117,6 +128,32 @@ contract CopyVault is Ownable, ReentrancyGuard {
         uint64 expireTimestampNs;
     }
 
+    struct BatchParams {
+        bytes32 marketId;
+        Side side;
+        address pool;
+        address outcomeToken;
+        uint256 yesId;
+        uint256 noId;
+        uint256 priceRaw;
+        uint256 quantityRaw;
+        uint64 expireTimestampNs;
+    }
+
+    struct Allocation {
+        address user;
+        uint256 collateral;
+    }
+
+    struct SplitState {
+        uint256 totalCollateral;
+        uint256 totalShares;
+        uint256 totalUsed;
+        uint256 sumUsed;
+        uint256 sumShares;
+        uint256 count;
+    }
+
     mapping(address => UserAccount) public accounts;
     mapping(uint256 => Position) public positions;
     uint256 public nextPositionId;
@@ -140,6 +177,13 @@ contract CopyVault is Ownable, ReentrancyGuard {
         uint256 collateral,
         uint256 shares
     );
+    event BatchPositionsOpened(
+        bytes32 indexed marketId,
+        uint8 indexed side,
+        uint256 totalShares,
+        uint256 totalCollateral,
+        uint256 count
+    );
     event PositionSettled(
         uint256 indexed positionId,
         address indexed user,
@@ -150,6 +194,10 @@ contract CopyVault is Ownable, ReentrancyGuard {
     event OperatorChanged(
         address indexed oldOperator,
         address indexed newOperator
+    );
+    event HouseAccountChanged(
+        address indexed oldHouse,
+        address indexed newHouse
     );
     event FeeBpsChanged(uint256 oldFeeBps, uint256 newFeeBps);
     event FeeRecipientChanged(
@@ -185,10 +233,7 @@ contract CopyVault is Ownable, ReentrancyGuard {
         require(_operator != address(0), "CopyVault: zero operator");
         require(_feeRecipient != address(0), "CopyVault: zero fee recipient");
         require(_feeBps <= MAX_FEE_BPS, "CopyVault: fee exceeds cap");
-        require(
-            _binaryModule != address(0),
-            "CopyVault: zero binary module"
-        );
+        require(_binaryModule != address(0), "CopyVault: zero binary module");
 
         collateralToken = IERC20(_collateralToken);
         collateralDecimals = IERC20Metadata(_collateralToken).decimals();
@@ -252,26 +297,7 @@ contract CopyVault is Ownable, ReentrancyGuard {
             "CopyVault: exceeds idle balance"
         );
 
-        MarketTokenInfo storage info = marketTokenInfo[p.marketId];
-        if (!info.set) {
-            require(
-                p.outcomeToken != address(0),
-                "CopyVault: zero outcome token"
-            );
-            info.outcomeToken = p.outcomeToken;
-            info.yesId = p.yesId;
-            info.noId = p.noId;
-            info.set = true;
-        } else {
-            require(
-                info.outcomeToken == p.outcomeToken,
-                "CopyVault: outcome token mismatch"
-            );
-            require(
-                info.yesId == p.yesId && info.noId == p.noId,
-                "CopyVault: outcome id mismatch"
-            );
-        }
+        _registerMarketToken(p.marketId, p.outcomeToken, p.yesId, p.noId);
         acct.balance -= p.collateral;
         acct.lockedInTrades += p.collateral;
 
@@ -315,6 +341,50 @@ contract CopyVault is Ownable, ReentrancyGuard {
         );
     }
 
+    function batchOpenPositions(
+        BatchParams calldata p,
+        Allocation[] calldata allocations
+    )
+        external
+        onlyOperator
+        nonReentrant
+        returns (uint256[] memory positionIds)
+    {
+        require(allocations.length > 0, "CopyVault: empty batch");
+        require(
+            allocations.length <= MAX_BATCH_SIZE,
+            "CopyVault: batch too large"
+        );
+
+        _registerMarketToken(p.marketId, p.outcomeToken, p.yesId, p.noId);
+
+        SplitState memory s;
+        s.totalCollateral = _lockAllocations(allocations);
+
+        (s.totalShares, s.totalUsed) = _placeTradeOnExchange(
+            p.pool,
+            p.side,
+            p.outcomeToken,
+            p.yesId,
+            p.noId,
+            p.priceRaw,
+            p.quantityRaw,
+            p.expireTimestampNs,
+            s.totalCollateral
+        );
+
+        positionIds = _distribute(p.marketId, p.side, allocations, s);
+        marketSideShares[p.marketId][uint8(p.side)] += s.totalShares;
+
+        emit BatchPositionsOpened(
+            p.marketId,
+            uint8(p.side),
+            s.totalShares,
+            s.totalUsed,
+            s.count
+        );
+    }
+
     /**
      * Redeem vault-held outcome for one market+side once after resolution.
      * Collateral recovered goes to marketPot[marketId].
@@ -343,10 +413,7 @@ contract CopyVault is Ownable, ReentrancyGuard {
                 binaryModule
             )
         ) {
-            IOutcomeToken(info.outcomeToken).setOperator(
-                binaryModule,
-                true
-            );
+            IOutcomeToken(info.outcomeToken).setOperator(binaryModule, true);
         }
 
         uint256 beforeBal = collateralToken.balanceOf(address(this));
@@ -402,7 +469,7 @@ contract CopyVault is Ownable, ReentrancyGuard {
         }
 
         uint256 fee = 0;
-        if (payout > pos.collateralAtEntry) {
+        if (payout > pos.collateralAtEntry && pos.user != houseAccount) {
             uint256 profit = payout - pos.collateralAtEntry;
             fee = (profit * feeBps) / 10_000;
         }
@@ -423,6 +490,12 @@ contract CopyVault is Ownable, ReentrancyGuard {
         require(newOperator != address(0), "CopyVault: zero operator");
         emit OperatorChanged(operator, newOperator);
         operator = newOperator;
+    }
+
+    function setHouseAccount(address newHouse) external onlyOwner {
+        require(newHouse != address(0), "CopyVault: zero house account");
+        emit HouseAccountChanged(houseAccount, newHouse);
+        houseAccount = newHouse;
     }
 
     function setFeeBps(uint256 newFeeBps) external onlyOwner {
@@ -467,6 +540,125 @@ contract CopyVault is Ownable, ReentrancyGuard {
     }
 
     // ++ Internal
+    function _registerMarketToken(
+        bytes32 marketId,
+        address outcomeToken,
+        uint256 yesId,
+        uint256 noId
+    ) internal {
+        MarketTokenInfo storage info = marketTokenInfo[marketId];
+        if (!info.set) {
+            require(outcomeToken != address(0), "CopyVault: zero outcome token");
+            info.outcomeToken = outcomeToken;
+            info.yesId = yesId;
+            info.noId = noId;
+            info.set = true;
+        } else {
+            require(
+                info.outcomeToken == outcomeToken,
+                "CopyVault: outcome token mismatch"
+            );
+            require(
+                info.yesId == yesId && info.noId == noId,
+                "CopyVault: outcome id mismatch"
+            );
+        }
+    }
+
+    /// Validates every allocation, moves collateral idle → locked, returns the sum.
+    function _lockAllocations(
+        Allocation[] calldata allocations
+    ) internal returns (uint256 total) {
+        for (uint256 i = 0; i < allocations.length; i++) {
+            uint256 c = allocations[i].collateral;
+            UserAccount storage acct = accounts[allocations[i].user];
+            require(acct.copyEnabled, "CopyVault: user not opted in");
+            require(c > 0, "CopyVault: zero collateral");
+            require(
+                c <= acct.tradeSize,
+                "CopyVault: exceeds user's per-trade size"
+            );
+            require(c <= acct.balance, "CopyVault: exceeds idle balance");
+            acct.balance -= c;
+            acct.lockedInTrades += c;
+            total += c;
+        }
+    }
+
+    /// Splits a batch fill pro-rata; last allocation absorbs rounding dust.
+    function _distribute(
+        bytes32 marketId,
+        Side side,
+        Allocation[] calldata allocations,
+        SplitState memory s
+    ) internal returns (uint256[] memory ids) {
+        uint256 n = allocations.length;
+        ids = new uint256[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 committed = allocations[i].collateral;
+            uint256 used;
+            uint256 shares;
+
+            if (i == n - 1) {
+                used = s.totalUsed - s.sumUsed;
+                shares = s.totalShares - s.sumShares;
+                if (used > committed) used = committed;
+            } else {
+                used = (s.totalUsed * committed) / s.totalCollateral;
+                shares = (s.totalShares * committed) / s.totalCollateral;
+                s.sumUsed += used;
+                s.sumShares += shares;
+            }
+
+            if (used == 0 && shares == 0) {
+                _refund(allocations[i].user, committed);
+                continue;
+            }
+
+            if (used < committed) {
+                _refund(allocations[i].user, committed - used);
+            }
+            ids[s.count++] = _recordPosition(
+                allocations[i].user,
+                marketId,
+                side,
+                used,
+                shares
+            );
+        }
+
+        // truncate to the number of positions actually created
+        uint256 count = s.count;
+        assembly {
+            mstore(ids, count)
+        }
+    }
+
+    function _refund(address user, uint256 amount) internal {
+        UserAccount storage acct = accounts[user];
+        acct.balance += amount;
+        acct.lockedInTrades -= amount;
+    }
+
+    function _recordPosition(
+        address user,
+        bytes32 marketId,
+        Side side,
+        uint256 used,
+        uint256 shares
+    ) internal returns (uint256 positionId) {
+        positionId = nextPositionId++;
+        positions[positionId] = Position({
+            user: user,
+            marketId: marketId,
+            side: side,
+            shares: shares,
+            collateralAtEntry: used,
+            settled: false
+        });
+        emit PositionOpened(positionId, user, marketId, side, used, shares);
+    }
 
     function _placeTradeOnExchange(
         address pool,

@@ -29,6 +29,16 @@ const OPERATOR_KEY = process.env.COPY_BOT_OPERATOR_PRIVATE_KEY;
 const PORT = Number(process.env.PORT ?? process.env.COPY_API_PORT ?? 8788);
 const DB_PATH = process.env.COPY_DB_PATH ?? "copy-trade.db";
 const QTY_STEP = Number(process.env.COPY_QTY_STEP ?? 0.01);
+// The bot's own trading capital, held in the vault as one more account
+// (same deposit()/setTradeSize()/setCopyEnabled(true) as any copier) so
+// batchOpenPositions can include it in the same aggregate order as every
+// copier. Must equal the vault's own houseAccount (set via setHouseAccount),
+// or settlement won't recognize it as fee-exempt.
+const HOUSE_ADDRESS = process.env.COPY_HOUSE_ADDRESS;
+if (!HOUSE_ADDRESS || !/^0x[a-fA-F0-9]{40}$/.test(HOUSE_ADDRESS)) {
+  console.error("Missing/invalid required env var: COPY_HOUSE_ADDRESS");
+  process.exit(1);
+}
 const WEBHOOK_SECRET = process.env.COPY_WEBHOOK_SECRET;
 const POLL_INTERVAL_MS = 3_000; // Check order book every 3 seconds
 const CUTOFF_BUFFER_MS = 1 * 60 * 1000; // Stop 1 minutes before expiry
@@ -58,7 +68,9 @@ const VAULT_ABI = [
   "function redeemMarket(bytes32 marketId, uint8 side)",
   "function getPosition(uint256 positionId) view returns (tuple(address user, bytes32 marketId, uint8 side, uint256 shares, uint256 collateralAtEntry, bool settled))",
   "function openPositionFor((address user, bytes32 marketId, uint8 side, uint256 collateral, address pool, address outcomeToken, uint256 yesId, uint256 noId, uint256 priceRaw, uint256 quantityRaw, uint64 expireTimestampNs) p) returns (uint256 positionId)",
+  "function batchOpenPositions((bytes32 marketId, uint8 side, address pool, address outcomeToken, uint256 yesId, uint256 noId, uint256 priceRaw, uint256 quantityRaw, uint64 expireTimestampNs) p, (address user, uint256 collateral)[] allocations) returns (uint256[] positionIds)",
   "event PositionOpened(uint256 indexed positionId, address indexed user, bytes32 marketId, uint8 side, uint256 collateral, uint256 shares)",
+  "event BatchPositionsOpened(bytes32 indexed marketId, uint8 indexed side, uint256 totalShares, uint256 totalCollateral, uint256 count)",
   "event PositionSettled(uint256 indexed positionId, address indexed user, uint256 payout, uint256 netPayout, uint256 fee)",
 
   // Custom Errors — Vault & Position validation
@@ -475,7 +487,7 @@ const ORDERBOOK_FETCH_TIMEOUT_MS = Number(
 const ORDERBOOK_MAX_AGE_MS = Number(
   process.env.COPY_ORDERBOOK_MAX_AGE_MS ?? 90_000
 );
-const ABSOLUTE_MAX_PRICE = 0.9; // never fill higher than 0.90, capped against drift
+const ABSOLUTE_MAX_PRICE = 0.8;
 
 /**
  * Pull live ask-side depth for one outcome leg from the bot's combined
@@ -574,6 +586,253 @@ function planFillsAgainstBook(users, levels, maxPrice, dec) {
     plan.push({ wallet: user.wallet, quantityRaw, priceRaw, collateralRaw });
   }
   return plan;
+}
+
+/**
+ * Sizes ONE order for the whole batch (house + every copier) against live
+ * book depth. Unlike planFillsAgainstBook (which gave each user their own
+ * walk and their own price), everyone in a batch shares a single priceRaw —
+ * so fairness here is proportional scaling, not walk order: if total demand
+ * exceeds available depth, every participant's fill is scaled down by the
+ * same ratio, house included.
+ *
+ * `participants` is [{ wallet, remainingCollateralRaw }, ...] with the house
+ * entry LAST (see batchOpenPositions' contract docstring — the contract
+ * gives the last allocation the rounding dust, and that must land on the
+ * house, never a copier). Returns null when nothing is fillable this tick.
+ */
+function planBatchFill(participants, levels, maxPrice, dec) {
+  const usable = levels.filter(
+    (l) => l.price > 0 && l.price <= maxPrice && l.amount > 0
+  );
+  const availableNotional = usable.reduce((s, l) => s + l.price * l.amount, 0);
+  if (availableNotional <= 0) return null;
+
+  const wantNotional = participants.reduce(
+    (s, p) => s + Number(ethers.formatUnits(p.remainingCollateralRaw, dec)),
+    0
+  );
+  if (wantNotional <= 0) return null;
+
+  // Same 90%-of-visible-depth conservatism planFillsAgainstBook already
+  // used, now applied once for the whole batch instead of per user.
+  const spendNotional = Math.min(wantNotional, availableNotional * 0.9);
+  if (spendNotional <= 0) return null;
+
+  let remaining = spendNotional;
+  let shares = 0;
+  let worstPrice = 0;
+  for (const lvl of usable) {
+    if (remaining <= 0) break;
+    const levelNotional = lvl.price * lvl.amount;
+    const take = Math.min(remaining, levelNotional);
+    shares += take / lvl.price;
+    worstPrice = Math.max(worstPrice, lvl.price);
+    remaining -= take;
+  }
+  if (shares <= 0 || worstPrice <= 0) return null;
+
+  const scale = spendNotional / wantNotional; // <= 1
+  const bufferedPrice = Math.min(maxPrice, worstPrice + PRICE_BUFFER);
+  const priceRaw = toRawUnits(bufferedPrice, dec, PRICE_STEP);
+  if (priceRaw <= 0n) return null;
+
+  const allocations = participants
+    .map((p) => {
+      const wantHuman = Number(
+        ethers.formatUnits(p.remainingCollateralRaw, dec)
+      );
+      const committed = wantHuman * scale;
+      return {
+        wallet: p.wallet,
+        collateralRaw: ethers.parseUnits(
+          Math.max(committed, 0).toFixed(Math.min(dec, 8)),
+          dec
+        ),
+      };
+    })
+    .filter((a) => a.collateralRaw > 0n);
+
+  if (allocations.length === 0) return null;
+
+  // quantityRaw MUST satisfy priceRaw * quantityRaw <= sum(collateralRaw),
+  // in INTEGER terms, or the contract's own `required <= collateral` check
+  // reverts the whole batch. `shares` above was walked at the real (cheaper,
+  // unbuffered) book prices, so deriving quantityRaw straight from it can
+  // overshoot what the buffered priceRaw actually affords — same trap the
+  // original single-user planFillsAgainstBook avoided by re-deriving max
+  // affordable quantity from priceRaw before taking the final figure.
+  const totalCollateralRaw = allocations.reduce(
+    (s, a) => s + a.collateralRaw,
+    0n
+  );
+  const one = 10n ** BigInt(dec);
+  const maxQtyFromCollateralRaw = (totalCollateralRaw * one) / priceRaw;
+  const maxSharesHuman = Number(
+    ethers.formatUnits(maxQtyFromCollateralRaw, dec)
+  );
+  const quantityRaw = stepQuantityRaw(Math.min(shares, maxSharesHuman), dec);
+  if (quantityRaw <= 0n) return null;
+
+  return {
+    priceRaw,
+    quantityRaw,
+    allocations,
+    scale,
+    worstPrice,
+    availableNotional,
+  };
+}
+
+/**
+ * Submits ONE batchOpenPositions tx for a sized plan. Mirrors submitFill's
+ * error handling, but parses N PositionOpened events out of one receipt
+ * instead of one.
+ */
+async function submitBatchFill(signal, dec, plan) {
+  const sideCode = signal.side === "BUY_YES" ? 0 : 1;
+  const batchParams = {
+    marketId: signal.marketId,
+    side: sideCode,
+    pool: signal.pool,
+    outcomeToken: signal.outcomeToken,
+    yesId: BigInt(signal.yesId),
+    noId: BigInt(signal.noId),
+    priceRaw: plan.priceRaw,
+    quantityRaw: plan.quantityRaw,
+    expireTimestampNs:
+      BigInt(
+        Math.floor(Number(signal.expiryMs ?? Date.now() + 15 * 60_000) / 1000)
+      ) * 1_000_000_000n,
+  };
+  const allocationsArg = plan.allocations.map((a) => ({
+    user: a.wallet,
+    collateral: a.collateralRaw,
+  }));
+
+  let receipt;
+  try {
+    const result = await executeTxWithRetry(async () => {
+      await withTimeout(
+        vault.batchOpenPositions.staticCall(batchParams, allocationsArg),
+        RPC_READ_TIMEOUT_MS,
+        "batchOpenPositions.staticCall()"
+      );
+      const tx = await vault.batchOpenPositions(batchParams, allocationsArg);
+      let rx;
+      try {
+        rx = await withTimeout(
+          tx.wait(),
+          RPC_TX_TIMEOUT_MS,
+          `batchOpenPositions tx.wait() (${tx.hash})`
+        );
+      } catch (waitErr) {
+        waitErr.isPostBroadcastTimeout = true;
+        waitErr.txHash = tx.hash;
+        throw waitErr;
+      }
+      return { tx, rx };
+    });
+    receipt = result.rx;
+  } catch (err) {
+    if (err.isPostBroadcastTimeout) {
+      log(
+        "signal",
+        `CRITICAL — batch tx ${err.txHash} broadcast but confirmation timed out. Verify on-chain manually before any retry.`
+      );
+      return { ok: false, filled: [] };
+    }
+    const reason = parseRevertReason(err, vault.interface);
+    log(
+      "signal",
+      `batch fill failed (limit ${Number(
+        ethers.formatUnits(plan.priceRaw, dec)
+      ).toFixed(4)}) → ${reason}`
+    );
+    return { ok: false, filled: [] };
+  }
+
+  const opened = receipt.logs
+    .map((l) => {
+      try {
+        return vault.interface.parseLog(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter((e) => e?.name === "PositionOpened");
+
+  const filled = [];
+  for (const ev of opened) {
+    try {
+      const positionId = Number(ev.args.positionId);
+      const wallet = ev.args.user;
+      const usedCollateral = Number(
+        ethers.formatUnits(ev.args.collateral, dec)
+      );
+      const shares = Number(ethers.formatUnits(ev.args.shares, dec));
+      const MIN_COLLATERAL = Number(process.env.COPY_MIN_COLLATERAL ?? 0.01);
+      if (usedCollateral < MIN_COLLATERAL || shares <= 0) {
+        log(
+          "signal",
+          `ignoring dust fill position ${positionId} for ${wallet}`
+        );
+        continue;
+      }
+      const entryPrice =
+        shares > 0 ? usedCollateral / shares : Number(signal.price);
+
+      db.prepare(
+        `
+        INSERT INTO copy_trades (
+          position_id, wallet_address, market_id, symbol, asset, window, side,
+          shares, collateral_at_entry, entry_price, tx_hash, status,
+          source_signal_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+      `
+      ).run(
+        positionId,
+        wallet.toLowerCase(),
+        signal.marketId,
+        signal.symbol ?? "",
+        signal.asset ?? "",
+        signal.window ?? "",
+        signal.side,
+        shares,
+        usedCollateral,
+        entryPrice,
+        receipt.hash,
+        signal.signalId ?? null,
+        Date.now()
+      );
+      if (wallet.toLowerCase() !== HOUSE_ADDRESS.toLowerCase()) {
+        recordEvent(
+          wallet.toLowerCase(),
+          "position_opened",
+          {
+            positionId,
+            marketId: signal.marketId,
+            collateral: usedCollateral,
+            shares,
+          },
+          receipt.hash
+        );
+      }
+      scheduleCheckpoint(`position_opened:${positionId}`);
+      filled.push({ wallet, positionId, usedCollateral, shares, entryPrice });
+    } catch (dbErr) {
+      log(
+        "signal",
+        `CRITICAL: position opened on-chain (tx: ${receipt.hash}) but DB write failed for one allocation: ${dbErr.message}`
+      );
+    }
+  }
+
+  log(
+    "signal",
+    `batch tx ${receipt.hash}: ${filled.length}/${plan.allocations.length} allocation(s) recorded`
+  );
+  return { ok: true, filled, txHash: receipt.hash };
 }
 
 /**
@@ -818,6 +1077,21 @@ async function fillAgainstBook(signal, dec, users) {
         0
       );
 
+      log(
+        "signal",
+        `${signal.symbol}: residual levels=${JSON.stringify(levels)} ` +
+          `notional=${availableNotional.toFixed(2)} ` +
+          `want=${wantNotional.toFixed(2)} ` +
+          `users=${remaining
+            .map(
+              (u) =>
+                `${u.wallet.slice(0, 8)}:${Number(
+                  ethers.formatUnits(u.remainingCollateralRaw, dec)
+                ).toFixed(2)}`
+            )
+            .join(",")}`
+      );
+
       // Scale a COPY for this tick only — never permanently shrink remaining
       // so later ticks can use full demand if depth recovers.
       let planUsers = remaining;
@@ -908,6 +1182,269 @@ async function fillAgainstBook(signal, dec, users) {
       "signal",
       `${signal.symbol}: cutoff reached with ${stillShort.length} copier(s) still short of full size`
     );
+  }
+}
+
+/**
+ * Book-aware batch fill: on every poll tick, fetch live ask depth ONCE,
+ * size ONE order for house + every still-short copier combined, submit it,
+ * subtract what filled from everyone's remaining want, and repeat until
+ * either everyone's filled, nothing is fillable, or the market's cutoff
+ * arrives. This replaces fillAgainstBook's per-user loop: there is no
+ * "bot already took the resting order" race anymore, because the house's
+ * own size is INSIDE this same order, not a separate earlier transaction.
+ */
+const attemptedMarkets = new Set(); // marketId already sent to chain this process
+
+async function fillBatchAgainstBook(signal, dec, houseEntry, copierEntries) {
+  const empty = { houseFill: null, copierFills: [] };
+  const signalPx = Number(signal.price);
+  const limitPx = Number(signal.limitPrice);
+  const maxSlippage = Number(process.env.COPY_MAX_SLIPPAGE ?? 0.05);
+  const maxPriceCap = Math.min(
+    Number(process.env.COPY_MAX_PRICE ?? ABSOLUTE_MAX_PRICE),
+    ABSOLUTE_MAX_PRICE,
+    Number.isFinite(signalPx) && signalPx > 0
+      ? signalPx + maxSlippage
+      : ABSOLUTE_MAX_PRICE,
+    Number.isFinite(limitPx) && limitPx > 0 ? limitPx : ABSOLUTE_MAX_PRICE
+  );
+  const expiryMs = Number(signal.expiryMs ?? Date.now() + 15 * 60_000);
+  const cutoffTimestamp = expiryMs - CUTOFF_BUFFER_MS;
+
+  if (!signal.venueSymbol) {
+    log("signal", `${signal.symbol}: no venueSymbol — skipping`);
+    return empty;
+  }
+  if (Date.now() > cutoffTimestamp) {
+    log("signal", `${signal.symbol}: skip — already past cutoff`);
+    return empty;
+  }
+
+  // Safe to retry: nothing has been submitted yet.
+  let asks = null;
+  for (let i = 0; i < 3 && !asks && Date.now() < cutoffTimestamp; i++) {
+    asks = await fetchAskDepth(signal.venueSymbol);
+    if (!asks) await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+  if (!asks) {
+    log("signal", `${signal.symbol}: no book snapshot — not submitting`);
+    return empty;
+  }
+
+  const levels = asks
+    .map((l) => ({ price: Number(l[0]), amount: Number(l[1]) }))
+    .filter((l) => l.price > 0 && l.amount > 0);
+
+  // House LAST so rounding dust lands on it.
+  const participants = [
+    ...copierEntries
+      .filter((u) => u.remainingCollateralRaw > 0n)
+      .map((u) => ({
+        wallet: u.wallet,
+        remainingCollateralRaw: u.remainingCollateralRaw,
+      })),
+    ...(houseEntry && houseEntry.remainingCollateralRaw > 0n
+      ? [
+          {
+            wallet: HOUSE_ADDRESS,
+            remainingCollateralRaw: houseEntry.remainingCollateralRaw,
+          },
+        ]
+      : []),
+  ];
+
+  const plan = planBatchFill(participants, levels, maxPriceCap, dec);
+  if (!plan) {
+    log(
+      "signal",
+      `${signal.symbol}: no fillable depth under cap ${maxPriceCap.toFixed(
+        3
+      )} — not submitting`
+    );
+    return empty;
+  }
+
+  log(
+    "signal",
+    `${signal.symbol}: ONE batch, ${
+      plan.allocations.length
+    } participant(s), scale=${(plan.scale * 100).toFixed(
+      0
+    )}%, cap=${maxPriceCap.toFixed(3)}`
+  );
+
+  // Mark BEFORE sending. A timeout after broadcast is ambiguous, so this
+  // market never gets a second batch whatever happens next.
+  attemptedMarkets.add(String(signal.marketId).toLowerCase());
+  const result = await submitBatchFill(signal, dec, plan);
+  if (!result.ok) return empty;
+
+  const houseFills = [];
+  const copierFillsByWallet = new Map();
+  for (const f of result.filled) {
+    if (f.wallet.toLowerCase() === HOUSE_ADDRESS.toLowerCase())
+      houseFills.push(f);
+    else {
+      const k = f.wallet.toLowerCase();
+      copierFillsByWallet.set(k, [...(copierFillsByWallet.get(k) ?? []), f]);
+    }
+  }
+  return {
+    houseFill: houseFills.length
+      ? {
+          totalCollateral: houseFills.reduce((s, f) => s + f.usedCollateral, 0),
+          totalShares: houseFills.reduce((s, f) => s + f.shares, 0),
+          fills: houseFills,
+        }
+      : null,
+    copierFills: [...copierFillsByWallet.entries()].map(([wallet, fills]) => ({
+      wallet,
+      fills,
+    })),
+  };
+}
+
+/**
+ * Entry point called synchronously by the bot (replaces the old /api/signal
+ * fire-and-forget + background poll). The bot provides its own sizing
+ * (houseCollateralRaw, already computed by takeOne()'s budget/quantize
+ * logic) and waits for the actual on-chain result before logging/posting —
+ * there is no more separate direct trade from the bot's own wallet.
+ */
+const executeInFlight = new Set(); 
+
+async function handleSignalExecute(signal) {
+  const empty = { houseFill: null, copierFills: [] };
+
+  if (signal.dryRun) {
+    log("signal", `dry-run signal for ${signal.symbol} — not executing`);
+    return empty;
+  }
+  if (!signal.pool || signal.pool === ethers.ZeroAddress) {
+    log("signal", `signal for ${signal.symbol} missing a pool address — skipping`);
+    return empty;
+  }
+  if (!signal.houseCollateralRaw) {
+    log("signal", `signal for ${signal.symbol} missing houseCollateralRaw — skipping`);
+    return empty;
+  }
+  // The contract takes bytes32; a 20-byte pool address fallback would revert.
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(signal.marketId))) {
+    log("signal", `${signal.symbol}: marketId is not bytes32 (${signal.marketId}) — skipping`);
+    return empty;
+  }
+
+  // (a) Dedupe: in-flight lock + in-memory attempts + DB (survives restart).
+  const mkt = String(signal.marketId).toLowerCase();
+  const alreadyInDb = db
+    .prepare(
+      `SELECT 1 FROM copy_trades WHERE LOWER(market_id)=? AND wallet_address=? LIMIT 1`
+    )
+    .get(mkt, HOUSE_ADDRESS.toLowerCase());
+  if (executeInFlight.has(mkt) || attemptedMarkets.has(mkt) || alreadyInDb) {
+    log("signal", `${signal.symbol}: already attempted/entered this market — refusing duplicate`);
+    return empty;
+  }
+  executeInFlight.add(mkt);
+
+  try {
+    const dec = await decimals();
+
+    // (c) House must never appear as a copier too.
+    const wallets = knownWallets().filter(
+      (w) => w.toLowerCase() !== HOUSE_ADDRESS.toLowerCase()
+    );
+    log(
+      "signal",
+      `${signal.symbol} ${signal.side} — house + checking ${wallets.length} known wallet(s)`
+    );
+
+    const userAccounts = await Promise.all(
+      wallets.map(async (w) => {
+        const [balance, , copyEnabled, tradeSize] = await vault
+          .getAccount(w)
+          .catch((e) => {
+            log("signal", `getAccount failed for ${w}: ${e.message}`);
+            return [0n, 0n, false, 0n];
+          });
+        if (!copyEnabled) return null;
+        const rawCollateral = tradeSize < balance ? tradeSize : balance;
+        if (rawCollateral <= 0n) return null;
+        return { wallet: w, remainingCollateralRaw: rawCollateral };
+      })
+    );
+    let eligible = userAccounts.filter((u) => u !== null);
+    eligible.sort((a, b) =>
+      a.remainingCollateralRaw < b.remainingCollateralRaw
+        ? -1
+        : a.remainingCollateralRaw > b.remainingCollateralRaw
+        ? 1
+        : 0
+    );
+
+    // (c) Contract MAX_BATCH_SIZE is 50 including the house.
+    if (eligible.length > 49) {
+      log("signal", `${signal.symbol}: ${eligible.length} eligible copiers, truncating to 49 (batch cap)`);
+      eligible = eligible.slice(0, 49);
+    }
+
+    const envMaxAgg = process.env.COPY_MAX_AGGREGATE_COLLATERAL;
+    const maxAggregateCollateral =
+      typeof signal.maxAggregateCollateral === "number"
+        ? signal.maxAggregateCollateral
+        : envMaxAgg
+        ? Number(envMaxAgg)
+        : null;
+    const totalRequestedCollateral = eligible.reduce(
+      (sum, item) =>
+        sum + Number(ethers.formatUnits(item.remainingCollateralRaw, dec)),
+      0
+    );
+    if (maxAggregateCollateral && totalRequestedCollateral > maxAggregateCollateral) {
+      const scaleFactor = maxAggregateCollateral / totalRequestedCollateral;
+      for (const item of eligible) {
+        const scaled =
+          Number(ethers.formatUnits(item.remainingCollateralRaw, dec)) * scaleFactor;
+        item.remainingCollateralRaw = ethers.parseUnits(scaled.toFixed(dec), dec);
+      }
+    }
+
+    const [houseBalance, , houseCopyEnabled, houseTradeSize] = await vault
+      .getAccount(HOUSE_ADDRESS)
+      .catch((e) => {
+        log("signal", `getAccount failed for house: ${e.message}`);
+        return [0n, 0n, false, 0n];
+      });
+    const requestedHouseRaw = BigInt(signal.houseCollateralRaw);
+    const houseCappedRaw = [houseBalance, houseTradeSize, requestedHouseRaw].reduce(
+      (a, b) => (a < b ? a : b)
+    );
+    const houseEntry =
+      houseCopyEnabled && houseCappedRaw > 0n
+        ? { wallet: HOUSE_ADDRESS, remainingCollateralRaw: houseCappedRaw }
+        : null;
+
+    // (b) No house entry => refuse. Copier-only positions are never journaled
+    // by the bot, so they would never settle.
+    if (!houseEntry) {
+      log(
+        "signal",
+        `${signal.symbol}: house account not fillable (copyEnabled=${houseCopyEnabled}, balance/tradeSize/requested=${houseBalance}/${houseTradeSize}/${requestedHouseRaw}) — refusing (copier-only trades would never settle)`
+      );
+      return empty;
+    }
+
+    const result = await fillBatchAgainstBook(signal, dec, houseEntry, eligible);
+
+    log(
+      "signal",
+      `${signal.symbol}: done — house ${result.houseFill ? "filled" : "unfilled"}, ` +
+        `${result.copierFills.length}/${eligible.length} copier(s) filled`
+    );
+    return result;
+  } finally {
+    executeInFlight.delete(mkt);
   }
 }
 
@@ -1331,7 +1868,7 @@ function isAddress(a) {
 
 const routes = {
   "GET /": async (_req, res) => json(res, 200, { ok: true }),
-  "POST /api/signal": async (req, res) => {
+  "POST /api/signal/execute": async (req, res) => {
     if (!isValidWebhookSecret(req)) {
       log(
         "signal",
@@ -1343,10 +1880,27 @@ const routes = {
     if (!signal.marketId || !signal.side || typeof signal.price !== "number") {
       return json(res, 400, { error: "invalid signal payload" });
     }
-    handleSignal(signal).catch((e) =>
-      log("signal", `handleSignal error: ${e.message}`)
-    );
-    return json(res, 202, { accepted: true });
+    try {
+      const result = await handleSignalExecute(signal);
+      const copierFlat = result.copierFills.flatMap((c) => c.fills);
+      const copierCollateral = copierFlat.reduce((s, f) => s + f.usedCollateral, 0);
+      const copierShares = copierFlat.reduce((s, f) => s + f.shares, 0);
+      const houseCollateral = result.houseFill?.totalCollateral ?? 0;
+      const houseShares = result.houseFill?.totalShares ?? 0;
+      return json(res, 200, {
+        filled: Boolean(result.houseFill),
+        houseCollateralUsed: houseCollateral,
+        houseSharesReceived: houseShares,
+        copierCount: result.copierFills.length,
+        copierCollateralUsed: copierCollateral,
+        copierSharesReceived: copierShares,
+        totalCollateralUsed: houseCollateral + copierCollateral,
+        totalSharesReceived: houseShares + copierShares,
+      });
+    } catch (e) {
+      log("signal", `handleSignalExecute error: ${e.message}`);
+      return json(res, 500, { error: e.message });
+    }
   },
 
   "POST /api/settlement": async (req, res) => {
