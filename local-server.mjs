@@ -454,10 +454,12 @@ function isValidWebhookSecret(req) {
 const PRICE_STEP = Number(process.env.COPY_PRICE_STEP ?? 0.0001); // 4dp price tick
 
 // Cushion added on top of the deepest price level a user's fill actually
-// needed, mirroring the `+0.002` cushion index.ts uses on its own IOCs —
-// gives the tx a little room against the book moving between our snapshot
-// and the broadcast landing.
 const PRICE_BUFFER = Number(process.env.COPY_PRICE_BUFFER ?? 0.01);
+
+// Venue price tick. Limit prices must land on this grid or the pool reverts.
+const PRICE_TICK = Number(process.env.COPY_PRICE_TICK ?? 0.001);
+const floorToTick = (p) =>
+  Math.round(Math.floor(p / PRICE_TICK + 1e-9) * PRICE_TICK * 1e6) / 1e6;
 
 function toRawUnits(human, dec, step) {
   const one = 10n ** BigInt(dec);
@@ -633,7 +635,11 @@ function planBatchFill(participants, levels, maxPrice, dec) {
   if (shares <= 0 || worstPrice <= 0) return null;
 
   const scale = spendNotional / wantNotional; // <= 1
-  const bufferedPrice = Math.min(maxPrice, worstPrice + PRICE_BUFFER);
+  // Snap down to the venue tick, but never below the worst level we sized against.
+  const bufferedPrice = floorToTick(
+    Math.min(maxPrice, worstPrice + PRICE_BUFFER)
+  );
+  if (bufferedPrice < worstPrice - 1e-9) return null;
   const priceRaw = toRawUnits(bufferedPrice, dec, PRICE_STEP);
   if (priceRaw <= 0n) return null;
 
@@ -747,7 +753,7 @@ async function submitBatchFill(signal, dec, plan) {
       "signal",
       `batch fill failed (limit ${Number(
         ethers.formatUnits(plan.priceRaw, dec)
-      ).toFixed(4)}) → ${reason}`
+      ).toFixed(4)}) → ${reason} [selector ${extractRevertData(err)}]`
     );
     return { ok: false, filled: [] };
   }
