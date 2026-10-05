@@ -698,9 +698,13 @@ contract CopyVault is Ownable, ReentrancyGuard {
 
         {
             uint8 kind = side == Side.Yes ? 0 : 2;
+            // The book is quoted in YES terms: a NO order's price is the complement.
+            uint256 orderPrice = side == Side.Yes
+                ? priceRaw
+                : (10 ** collateralDecimals) - priceRaw;
             (bool success, ) = IBinaryPool(pool).placeBinaryOrder(
                 kind,
-                priceRaw,
+                orderPrice,
                 quantityRaw,
                 expireTimestampNs,
                 2,

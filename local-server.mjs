@@ -1279,7 +1279,7 @@ async function fillBatchAgainstBook(signal, dec, houseEntry, copierEntries) {
       0
     )}%, cap=${maxPriceCap.toFixed(3)}`
   );
-
+  log("signal", `${signal.symbol}: levels ${JSON.stringify(levels.slice(0, 4))} | limit ${ethers.formatUnits(plan.priceRaw, dec)} | bot ask ${signal.price}`);
   // Mark BEFORE sending. A timeout after broadcast is ambiguous, so this
   // market never gets a second batch whatever happens next.
   attemptedMarkets.add(String(signal.marketId).toLowerCase());
