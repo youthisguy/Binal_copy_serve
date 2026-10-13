@@ -645,17 +645,12 @@ function planBatchFill(participants, levels, maxPrice, dec) {
 
   const allocations = participants
     .map((p) => {
-      const wantHuman = Number(
-        ethers.formatUnits(p.remainingCollateralRaw, dec)
-      );
-      const committed = wantHuman * scale;
-      return {
-        wallet: p.wallet,
-        collateralRaw: ethers.parseUnits(
-          Math.max(committed, 0).toFixed(Math.min(dec, 8)),
-          dec
-        ),
-      };
+      const bp = BigInt(Math.floor(scale * 10_000));
+      let collateralRaw = (p.remainingCollateralRaw * bp) / 10_000n;
+      if (collateralRaw > p.remainingCollateralRaw) {
+        collateralRaw = p.remainingCollateralRaw;
+      }
+      return { wallet: p.wallet, collateralRaw };
     })
     .filter((a) => a.collateralRaw > 0n);
 
@@ -1280,6 +1275,54 @@ async function fillBatchAgainstBook(signal, dec, houseEntry, copierEntries) {
     )}%, cap=${maxPriceCap.toFixed(3)}`
   );
   log("signal", `${signal.symbol}: levels ${JSON.stringify(levels.slice(0, 4))} | limit ${ethers.formatUnits(plan.priceRaw, dec)} | bot ask ${signal.price}`);
+  // Pre-flight: clamp every allocation to LIVE on-chain state so one bad
+  // participant can't revert the whole batch. Nothing is broadcast yet.
+  {
+    let clamped = false;
+    const fixed = [];
+    for (const a of plan.allocations) {
+      const [bal, , en, size] = await vault.getAccount(a.wallet);
+      if (!en) {
+        log("signal", `PREFLIGHT drop ${a.wallet}: copy disabled`);
+        clamped = true;
+        continue;
+      }
+      let c = a.collateralRaw;
+      if (c > bal) c = bal;
+      if (c > size) c = size;
+      if (c !== a.collateralRaw) {
+        log(
+          "signal",
+          `PREFLIGHT clamp ${a.wallet}: alloc=${a.collateralRaw} bal=${bal} size=${size} -> ${c}`
+        );
+        clamped = true;
+      }
+      if (c > 0n) fixed.push({ wallet: a.wallet, collateralRaw: c });
+    }
+    if (
+      fixed.length === 0 ||
+      !fixed.some((a) => a.wallet.toLowerCase() === HOUSE_ADDRESS.toLowerCase())
+    ) {
+      log("signal", `${signal.symbol}: house not fillable after preflight — not submitting`);
+      return empty;
+    }
+    if (clamped) {
+      plan.allocations = fixed;
+      const total = fixed.reduce((s, a) => s + a.collateralRaw, 0n);
+      const one = 10n ** BigInt(dec);
+      const maxQty = (total * one) / plan.priceRaw;
+      const q = stepQuantityRaw(
+        Math.min(
+          Number(ethers.formatUnits(plan.quantityRaw, dec)),
+          Number(ethers.formatUnits(maxQty, dec))
+        ),
+        dec
+      );
+      if (q <= 0n) return empty;
+      plan.quantityRaw = q;
+    }
+  }
+
   // Mark BEFORE sending. A timeout after broadcast is ambiguous, so this
   // market never gets a second batch whatever happens next.
   attemptedMarkets.add(String(signal.marketId).toLowerCase());
@@ -1410,9 +1453,10 @@ async function handleSignalExecute(signal) {
     if (maxAggregateCollateral && totalRequestedCollateral > maxAggregateCollateral) {
       const scaleFactor = maxAggregateCollateral / totalRequestedCollateral;
       for (const item of eligible) {
-        const scaled =
-          Number(ethers.formatUnits(item.remainingCollateralRaw, dec)) * scaleFactor;
-        item.remainingCollateralRaw = ethers.parseUnits(scaled.toFixed(dec), dec);
+        item.remainingCollateralRaw =
+          (item.remainingCollateralRaw *
+            BigInt(Math.floor(scaleFactor * 10_000))) /
+          10_000n;
       }
     }
 
